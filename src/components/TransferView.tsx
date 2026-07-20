@@ -984,7 +984,7 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
 
                             {/* Delete File */}
                             <button
-                              onClick={() => handleDeleteFile(file.code)}
+                              // onClick={() => handleDeleteFile(file.code)}
                               className="p-2 bg-rose-500/10 hover:bg-rose-500 text-rose-400 hover:text-white rounded-lg border border-rose-500/20 hover:border-rose-500 transition duration-150 cursor-pointer"
                               title="Delete File Upload"
                             >
