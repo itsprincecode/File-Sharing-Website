@@ -565,7 +565,7 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                   }`}
                 >
                   {tab === "transfer" && "Transfer"}
-                  {tab === "collect" && `Collect (${activeFiles.length})`}
+                  {tab === "collect" && `Collection (${activeFiles.length})`}
                   {tab === "download" && "Download"}
 
                   {activeTab === tab && (
