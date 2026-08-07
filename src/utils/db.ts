@@ -13,7 +13,7 @@ export interface SharedFile {
   type: string;
   data: Blob;
   createdAt: number;
-  expiresAt: number;
+  // expiresAt: number;
 }
 
 /**
@@ -52,8 +52,8 @@ async function generateUniqueCode(): Promise<string> {
 export async function saveFile(file: File): Promise<SharedFile> {
   const code = await generateUniqueCode();
   const now = Date.now();
-  const sevenDays = 7 * 24 * 60 * 60 * 1000; // 7 days in ms
-  const expiresAt = now + sevenDays;
+  // const sevenDays = 7 * 24 * 60 * 60 * 1000; // 7 days in ms
+  // const expiresAt = now + sevenDays;
 
   // Convert the file blob to Base64 to store in the text column
   let base64Data = "";
@@ -72,7 +72,7 @@ export async function saveFile(file: File): Promise<SharedFile> {
       size: file.size,
       type: file.type || "application/octet-stream",
       created_at: now,
-      expires_at: expiresAt,
+      // expires_at: expiresAt,
       is_base64_fallback: true,
       base64_data: base64Data
     });
@@ -94,7 +94,7 @@ export async function saveFile(file: File): Promise<SharedFile> {
     type: file.type || "application/octet-stream",
     data: file,
     createdAt: now,
-    expiresAt,
+    // expiresAt,
   };
 }
 
@@ -119,12 +119,12 @@ export async function getFile(code: string): Promise<SharedFile | null> {
 
   if (!data) return null;
 
-  const now = Date.now();
-  // Check if expired
-  if (now > data.expires_at) {
-    await deleteFile(code);
-    return null;
-  }
+  // const now = Date.now();
+  // // Check if expired
+  // if (now > data.expires_at) {
+  //   await deleteFile(code);
+  //   return null;
+  // }
 
   // Re-assemble Blob from base64 string
   let blob: Blob;
@@ -141,7 +141,7 @@ export async function getFile(code: string): Promise<SharedFile | null> {
     type: data.type,
     data: blob,
     createdAt: data.created_at,
-    expiresAt: data.expires_at,
+    // expiresAt: data.expires_at,
   };
 }
 
@@ -179,30 +179,49 @@ export async function listAllFiles(): Promise<SharedFile[]> {
   }
 
   const activeFiles: SharedFile[] = [];
-  const now = Date.now();
+  // const now = Date.now();
+
+  // for (const item of (data || [])) {
+  //   if (now > item.expires_at) {
+  //     await deleteFile(item.code);
+  //   } else {
+  //     let blob: Blob;
+  //     if (item.is_base64_fallback && item.base64_data) {
+  //       blob = base64ToBlob(item.base64_data, item.type);
+  //     } else {
+  //       blob = new Blob([], { type: item.type });
+  //     }
+
+  //     activeFiles.push({
+  //       code: item.code,
+  //       name: item.name,
+  //       size: item.size,
+  //       type: item.type,
+  //       data: blob,
+  //       createdAt: item.created_at,
+  //       // expiresAt: item.expires_at,
+  //     });
+  //   }
+  // }
 
   for (const item of (data || [])) {
-    if (now > item.expires_at) {
-      await deleteFile(item.code);
-    } else {
-      let blob: Blob;
-      if (item.is_base64_fallback && item.base64_data) {
-        blob = base64ToBlob(item.base64_data, item.type);
-      } else {
-        blob = new Blob([], { type: item.type });
-      }
+  let blob: Blob;
 
-      activeFiles.push({
-        code: item.code,
-        name: item.name,
-        size: item.size,
-        type: item.type,
-        data: blob,
-        createdAt: item.created_at,
-        expiresAt: item.expires_at,
-      });
-    }
+  if (item.is_base64_fallback && item.base64_data) {
+    blob = base64ToBlob(item.base64_data, item.type);
+  } else {
+    blob = new Blob([], { type: item.type });
   }
+
+  activeFiles.push({
+    code: item.code,
+    name: item.name,
+    size: item.size,
+    type: item.type,
+    data: blob,
+    createdAt: item.created_at,
+  });
+}
 
   return activeFiles;
 }
@@ -210,22 +229,22 @@ export async function listAllFiles(): Promise<SharedFile[]> {
 /**
  * Helper to check expired files on Supabase and clean them up
  */
-export async function cleanupExpiredFiles(): Promise<number> {
-  const { data, error } = await supabase
-    .from("shared_files")
-    .select("code, expires_at");
+// export async function cleanupExpiredFiles(): Promise<number> {
+//   const { data, error } = await supabase
+//     .from("shared_files")
+//     .select("code, expires_at");
 
-  if (error || !data) return 0;
+//   if (error || !data) return 0;
 
-  const now = Date.now();
-  let deletedCount = 0;
+//   const now = Date.now();
+//   let deletedCount = 0;
 
-  for (const file of data) {
-    if (now > file.expires_at) {
-      await deleteFile(file.code);
-      deletedCount++;
-    }
-  }
+//   for (const file of data) {
+//     if (now > file.expires_at) {
+//       await deleteFile(file.code);
+//       deletedCount++;
+//     }
+//   }
 
-  return deletedCount;
-}
+//   return deletedCount;
+// }
