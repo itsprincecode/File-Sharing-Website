@@ -13,7 +13,7 @@ export interface SharedFile {
   type: string;
   data: Blob;
   createdAt: number;
-  // expiresAt: number;
+  expiresAt: number;
 }
 
 /**
@@ -52,8 +52,8 @@ async function generateUniqueCode(): Promise<string> {
 export async function saveFile(file: File): Promise<SharedFile> {
   const code = await generateUniqueCode();
   const now = Date.now();
-  // const sevenDays = 7 * 24 * 60 * 60 * 1000; // 7 days in ms
-  // const expiresAt = now + sevenDays;
+  const sevenDays = 7 * 24 * 60 * 60 * 1000; // 7 days in ms
+  const expiresAt = now + sevenDays;
 
   // Convert the file blob to Base64 to store in the text column
   let base64Data = "";
@@ -72,7 +72,7 @@ export async function saveFile(file: File): Promise<SharedFile> {
       size: file.size,
       type: file.type || "application/octet-stream",
       created_at: now,
-      // expires_at: expiresAt,
+      expires_at: expiresAt,
       is_base64_fallback: true,
       base64_data: base64Data
     });
@@ -94,7 +94,7 @@ export async function saveFile(file: File): Promise<SharedFile> {
     type: file.type || "application/octet-stream",
     data: file,
     createdAt: now,
-    // expiresAt,
+    expiresAt,
   };
 }
 
@@ -141,7 +141,7 @@ export async function getFile(code: string): Promise<SharedFile | null> {
     type: data.type,
     data: blob,
     createdAt: data.created_at,
-    // expiresAt: data.expires_at,
+    expiresAt: data.expires_at,
   };
 }
 
@@ -220,6 +220,7 @@ export async function listAllFiles(): Promise<SharedFile[]> {
     type: item.type,
     data: blob,
     createdAt: item.created_at,
+    expiresAt: item.expires_at,
   });
 }
 
