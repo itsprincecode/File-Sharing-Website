@@ -29,7 +29,7 @@ import {
   getFile,
   listAllFiles,
   deleteFile,
-  cleanupExpiredFiles,
+  // cleanupExpiredFiles,
 } from "../utils/db";
 import { SUPABASE_SETUP_SQL } from "../utils/supabase";
 import { TransferSubTab, UserSession, UploadProgress } from "../types";
@@ -72,14 +72,18 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Load active files on mount and when tab changes to Collect
+  // useEffect(() => {
+  //   loadFiles();
+  //   // Periodically run cleanup for expired transfers
+  //   cleanupExpiredFiles().then((cnt) => {
+  //     if (cnt > 0) {
+  //       loadFiles();
+  //     }
+  //   });
+  // }, [activeTab]);
+
   useEffect(() => {
     loadFiles();
-    // Periodically run cleanup for expired transfers
-    cleanupExpiredFiles().then((cnt) => {
-      if (cnt > 0) {
-        loadFiles();
-      }
-    });
   }, [activeTab]);
 
   const loadFiles = async () => {
@@ -136,7 +140,7 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
           session.tier === "Pro"
             ? "Pro size limit is 10GB."
             : "Free tier is limited to 2GB. Please Log In for 10GB tier!"
-        }`
+        }`,
       );
       return;
     }
@@ -237,7 +241,7 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
   const handleDeleteFile = async (code: string) => {
     if (
       confirm(
-        "Are you sure you want to delete this file sharing link? This cannot be undone."
+        "Are you sure you want to delete this file sharing link? This cannot be undone.",
       )
     ) {
       await deleteFile(code);
@@ -266,7 +270,7 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
 
   const handleDigitKeyDown = (
     index: number,
-    e: React.KeyboardEvent<HTMLInputElement>
+    e: React.KeyboardEvent<HTMLInputElement>,
   ) => {
     if (e.key === "Backspace" && !codeDigits[index] && index > 0) {
       const freshDigits = [...codeDigits];
@@ -320,7 +324,7 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
         if (err?.message === "SUPABASE_TABLE_MISSING") {
           setSupabaseSetupNeeded(true);
           setSearchError(
-            "Supabase database table is not found. See setup instructions."
+            "Supabase database table is not found. See setup instructions.",
           );
         } else {
           setSearchError("Operational retrieve error. Please try again.");
@@ -357,7 +361,7 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
     }
     if (
       ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tiff"].includes(
-        ext
+        ext,
       ) ||
       fileType.startsWith("image/")
     ) {
@@ -560,8 +564,8 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                     activeTab === tab
                       ? "text-cyan-500 font-black"
                       : darkMode
-                      ? "text-gray-400 hover:text-gray-200"
-                      : "text-gray-500 hover:text-gray-800"
+                        ? "text-gray-400 hover:text-gray-200"
+                        : "text-gray-500 hover:text-gray-800"
                   }`}
                 >
                   {tab === "transfer" && "Transfer"}
@@ -580,7 +584,7 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                     />
                   )}
                 </button>
-              )
+              ),
             )}
           </div>
         </div>
@@ -609,8 +613,8 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                     dragActive
                       ? "border-cyan-400 bg-cyan-500/5 scale-[0.99] shadow-inner"
                       : darkMode
-                      ? "border-gray-800 hover:border-gray-700 bg-gray-900/10"
-                      : "border-gray-200 hover:border-cyan-200 bg-gray-50/30"
+                        ? "border-gray-800 hover:border-gray-700 bg-gray-900/10"
+                        : "border-gray-200 hover:border-cyan-200 bg-gray-50/30"
                   }`}
                 >
                   {/* Simulated circle buttons mirroring Sendro visual layout exactly */}
@@ -821,7 +825,7 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                     <div className="shrink-0">
                       {getFileIcon(
                         latestUploadedFile.name,
-                        latestUploadedFile.type
+                        latestUploadedFile.type,
                       )}
                     </div>
                     <div className="truncate pr-4">
@@ -956,8 +960,8 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                                 copiedCode === file.code
                                   ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-400"
                                   : darkMode
-                                  ? "bg-gray-800 border-gray-700 hover:text-cyan-400 hover:border-cyan-500/30 text-gray-400"
-                                  : "bg-white border-gray-200 hover:text-cyan-500 hover:border-cyan-400/30 text-gray-600"
+                                    ? "bg-gray-800 border-gray-700 hover:text-cyan-400 hover:border-cyan-500/30 text-gray-400"
+                                    : "bg-white border-gray-200 hover:text-cyan-500 hover:border-cyan-400/30 text-gray-600"
                               }`}
                               title="Copy sharing code"
                             >
