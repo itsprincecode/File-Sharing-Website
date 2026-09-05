@@ -160,72 +160,108 @@ export async function deleteFile(code: string): Promise<void> {
   }
 }
 
-/**
- * Lists all active files from Supabase
- * Automatically cleans up any expired files found during listing
- */
 export async function listAllFiles(): Promise<SharedFile[]> {
   const { data, error } = await supabase
     .from("shared_files")
-    .select("*");
+    .select(`
+      code,
+      name,
+      size,
+      type,
+      created_at,
+      expires_at,
+      is_base64_fallback
+    `)
+    .order("created_at", { ascending: false })
+    .limit(100);
 
   if (error) {
     if (error.code === "42P01") {
-      // Just return empty if table doesn't exist yet, instead of crashing list
       return [];
     }
+
     console.error("Supabase List Error:", error);
-    return [];
+    throw error;
   }
 
-  const activeFiles: SharedFile[] = [];
-  // const now = Date.now();
-
-  // for (const item of (data || [])) {
-  //   if (now > item.expires_at) {
-  //     await deleteFile(item.code);
-  //   } else {
-  //     let blob: Blob;
-  //     if (item.is_base64_fallback && item.base64_data) {
-  //       blob = base64ToBlob(item.base64_data, item.type);
-  //     } else {
-  //       blob = new Blob([], { type: item.type });
-  //     }
-
-  //     activeFiles.push({
-  //       code: item.code,
-  //       name: item.name,
-  //       size: item.size,
-  //       type: item.type,
-  //       data: blob,
-  //       createdAt: item.created_at,
-  //       // expiresAt: item.expires_at,
-  //     });
-  //   }
-  // }
-
-  for (const item of (data || [])) {
-  let blob: Blob;
-
-  if (item.is_base64_fallback && item.base64_data) {
-    blob = base64ToBlob(item.base64_data, item.type);
-  } else {
-    blob = new Blob([], { type: item.type });
-  }
-
-  activeFiles.push({
+  return (data || []).map((item) => ({
     code: item.code,
     name: item.name,
     size: item.size,
     type: item.type,
-    data: blob,
+    data: new Blob([], { type: item.type }),
     createdAt: item.created_at,
     expiresAt: item.expires_at,
-  });
+  }));
 }
 
-  return activeFiles;
-}
+
+/**
+ * Lists all active files from Supabase
+ * Automatically cleans up any expired files found during listing
+ */
+// export async function listAllFiles(): Promise<SharedFile[]> {
+//   const { data, error } = await supabase
+//     .from("shared_files")
+//     .select("*");
+
+//   if (error) {
+//     if (error.code === "42P01") {
+//       // Just return empty if table doesn't exist yet, instead of crashing list
+//       return [];
+//     }
+//     console.error("Supabase List Error:", error);
+//     throw error;
+//   }
+
+//   const activeFiles: SharedFile[] = [];
+//   // const now = Date.now();
+
+//   // for (const item of (data || [])) {
+//   //   if (now > item.expires_at) {
+//   //     await deleteFile(item.code);
+//   //   } else {
+//   //     let blob: Blob;
+//   //     if (item.is_base64_fallback && item.base64_data) {
+//   //       blob = base64ToBlob(item.base64_data, item.type);
+//   //     } else {
+//   //       blob = new Blob([], { type: item.type });
+//   //     }
+
+//   //     activeFiles.push({
+//   //       code: item.code,
+//   //       name: item.name,
+//   //       size: item.size,
+//   //       type: item.type,
+//   //       data: blob,
+//   //       createdAt: item.created_at,
+//   //       // expiresAt: item.expires_at,
+//   //     });
+//   //   }
+//   // }
+
+//   for (const item of (data || [])) {
+//   let blob: Blob;
+
+//   if (item.is_base64_fallback && item.base64_data) {
+//     blob = base64ToBlob(item.base64_data, item.type);
+//   } else {
+//     blob = new Blob([], { type: item.type });
+//   }
+
+//   activeFiles.push({
+//     code: item.code,
+//     name: item.name,
+//     size: item.size,
+//     type: item.type,
+//     data: blob,
+//     createdAt: item.created_at,
+//     expiresAt: item.expires_at,
+//   });
+// }
+
+//   return activeFiles;
+// }
 
 /**
  * Helper to check expired files on Supabase and clean them up
