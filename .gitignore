@@ -5,9 +5,15 @@ coverage/
 .DS_Store
 *.log
 .env*
-!.env.example
+.env.local
+
+# Logs
+npm-debug.log*
+
+# IDE
 .vscode/
 .idea/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+
+# OS
+.DS_Store
+Thumbs.db

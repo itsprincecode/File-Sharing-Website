@@ -22,6 +22,16 @@ import {
   CalendarDays,
   Lock,
   ArrowRight,
+  Folder,
+  FolderArchive,
+  FolderOpen,
+  FolderTree,
+  Eye,
+  X,
+  Layers,
+  Share2,
+  ExternalLink,
+  Loader2,
 } from "lucide-react";
 import {
   SharedFile,
@@ -29,21 +39,35 @@ import {
   getFile,
   listAllFiles,
   deleteFile,
-  // cleanupExpiredFiles,
+  cleanupExpiredFiles,
 } from "../utils/db";
-import { SUPABASE_SETUP_SQL } from "../utils/supabase";
+import {
+  getFilesFromDataTransfer,
+  packageFolderToZip,
+  inspectZipContents,
+  FileWithPath,
+  ZipContentEntry,
+} from "../utils/folderHelper";
 import { TransferSubTab, UserSession, UploadProgress } from "../types";
+import ShareModal, { ShareableFileData } from "./ShareModal";
 import { motion, AnimatePresence } from "motion/react";
 
 interface TransferViewProps {
-  darkMode: boolean;
   session: UserSession;
+  onNavigateToWorkspace?: () => void;
+  openLoginModal?: (isSignUp?: boolean) => void;
 }
 
-export default function TransferView({ darkMode, session }: TransferViewProps) {
+export default function TransferView({
+  session,
+  onNavigateToWorkspace,
+  openLoginModal,
+}: TransferViewProps) {
   const [activeTab, setActiveTab] = useState<TransferSubTab>("transfer");
   const [dragActive, setDragActive] = useState(false);
   const [activeFiles, setActiveFiles] = useState<SharedFile[]>([]);
+  const [isCollectLoading, setIsCollectLoading] = useState(false);
+  const [downloadingCode, setDownloadingCode] = useState<string | null>(null);
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
 
   // Upload progress simulation
@@ -65,36 +89,100 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
   const [isSearchingCode, setIsSearchingCode] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [foundFile, setFoundFile] = useState<SharedFile | null>(null);
+  const [sharingFile, setSharingFile] = useState<ShareableFileData | null>(
+    null,
+  );
 
-  const [supabaseSetupNeeded, setSupabaseSetupNeeded] = useState(false);
-  const [copiedSql, setCopiedSql] = useState(false);
+  // In-app non-intrusive notification (replaces browser alerts)
+  const [noticeMessage, setNoticeMessage] = useState<{
+    text: string;
+    type: "error" | "info" | "success";
+  } | null>(null);
+
+  const showNotice = (
+    text: string,
+    type: "error" | "info" | "success" = "error",
+  ) => {
+    setNoticeMessage({ text, type });
+    setTimeout(() => setNoticeMessage(null), 5000);
+  };
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
 
-  // Load active files on mount and when tab changes to Collect
-  // useEffect(() => {
-  //   loadFiles();
-  //   // Periodically run cleanup for expired transfers
-  //   cleanupExpiredFiles().then((cnt) => {
-  //     if (cnt > 0) {
-  //       loadFiles();
-  //     }
-  //   });
-  // }, [activeTab]);
-
+  // Check URL parameters for direct shared ?code=XXXXXX
   useEffect(() => {
-    loadFiles();
+    try {
+      const urlParams = new URLSearchParams(window.location.search);
+      let targetCode = urlParams.get("code");
+      if (!targetCode && window.location.hash.includes("code=")) {
+        targetCode = window.location.hash.split("code=")[1]?.slice(0, 6);
+      }
+      if (targetCode && /^\d{6}$/.test(targetCode)) {
+        setActiveTab("download");
+        setCodeDigits(targetCode.split(""));
+        setIsSearchingCode(true);
+        getFile(targetCode)
+          .then((file) => {
+            setIsSearchingCode(false);
+            if (file) {
+              setFoundFile(file);
+            } else {
+              setSearchError(
+                "This download code is invalid, expired, or deleted.",
+              );
+            }
+          })
+          .catch(() => {
+            setIsSearchingCode(false);
+            setSearchError("Operational retrieve error. Please try again.");
+          });
+      }
+    } catch (e) {
+      console.error("URL code parse error", e);
+    }
+  }, []);
+
+  // Folder Content Inspection Modal
+  const [inspectingFolder, setInspectingFolder] = useState<{
+    name: string;
+    entries: ZipContentEntry[];
+  } | null>(null);
+  const [isInspectingLoading, setIsInspectingLoading] = useState(false);
+
+  // Attach webkitdirectory & directory attributes to folder input
+  useEffect(() => {
+    if (folderInputRef.current) {
+      folderInputRef.current.setAttribute("webkitdirectory", "");
+      folderInputRef.current.setAttribute("directory", "");
+      folderInputRef.current.setAttribute("multiple", "");
+    }
+  }, []);
+
+  // Load active files immediately on mount and when tab changes to Collect
+  useEffect(() => {
+    // Show spinner if opening Collect tab with no loaded files yet
+    const shouldShowSpinner =
+      activeFiles.length === 0 && activeTab === "collect";
+    loadFiles(shouldShowSpinner);
+
+    // Run non-blocking background cleanup periodically
+    cleanupExpiredFiles().then((cnt) => {
+      if (cnt > 0) {
+        loadFiles(false);
+      }
+    });
   }, [activeTab]);
 
-  const loadFiles = async () => {
+  const loadFiles = async (showLoading = false) => {
+    if (showLoading) setIsCollectLoading(true);
     try {
-      const files = await listAllFiles();
+      const files = await listAllFiles(true, true);
       setActiveFiles(files);
     } catch (err: any) {
-      if (err?.message === "SUPABASE_TABLE_MISSING") {
-        setSupabaseSetupNeeded(true);
-      }
-      console.error(err);
+      console.error("Failed to load active files:", err);
+    } finally {
+      if (showLoading) setIsCollectLoading(false);
     }
   };
 
@@ -114,8 +202,41 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
     e.stopPropagation();
     setDragActive(false);
 
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      await handleFileUpload(e.dataTransfer.files[0]);
+    // Check if items contain directories via DataTransferItemList
+    if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+      try {
+        const folderResult = await getFilesFromDataTransfer(
+          e.dataTransfer.items,
+        );
+        if (folderResult.isFolder && folderResult.files.length > 0) {
+          await processAndUploadFolder(
+            folderResult.files,
+            folderResult.folderName,
+          );
+          return;
+        } else if (folderResult.files.length === 1) {
+          await handleFileUpload(folderResult.files[0].file);
+          return;
+        }
+      } catch (err) {
+        console.warn("Folder drop fallback:", err);
+      }
+    }
+
+    // Fallback to standard dataTransfer.files
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      if (e.dataTransfer.files.length > 1) {
+        const fileList: FileWithPath[] = [];
+        for (let i = 0; i < e.dataTransfer.files.length; i++) {
+          fileList.push({
+            file: e.dataTransfer.files[i],
+            relativePath: e.dataTransfer.files[i].name,
+          });
+        }
+        await processAndUploadFolder(fileList, "Shared_Files");
+      } else {
+        await handleFileUpload(e.dataTransfer.files[0]);
+      }
     }
   };
 
@@ -123,52 +244,163 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
     fileInputRef.current?.click();
   };
 
+  const triggerFolderSelect = () => {
+    folderInputRef.current?.click();
+  };
+
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       await handleFileUpload(e.target.files[0]);
     }
+    e.target.value = "";
   };
 
-  // Perform upload logic with progress animation
-  const handleFileUpload = async (file: File) => {
-    // Check max upload limits based on user tier
+  const handleFolderChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      const files = e.target.files;
+      const fileItems: FileWithPath[] = [];
+      let detectedFolderName = "Folder";
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const relPath = file.webkitRelativePath || file.name;
+        if (file.webkitRelativePath) {
+          const parts = file.webkitRelativePath.split("/");
+          if (parts[0]) detectedFolderName = parts[0];
+        }
+        fileItems.push({ file, relativePath: relPath });
+      }
+
+      await processAndUploadFolder(fileItems, detectedFolderName);
+    }
+    e.target.value = "";
+  };
+
+  // Compresses folder into a single ZIP file then uploads to Supabase
+  const processAndUploadFolder = async (
+    fileItems: FileWithPath[],
+    folderName: string,
+  ) => {
+    if (fileItems.length === 0) return;
+
+    const totalRawSize = fileItems.reduce(
+      (acc, curr) => acc + curr.file.size,
+      0,
+    );
     const limitBytes =
-      session.tier === "Pro" ? 10 * 1024 * 1024 * 1024 : 2 * 1024 * 1024 * 1024; // 10GB vs 2GB
-    if (file.size > limitBytes) {
-      alert(
-        `File size exceeds limit. ${
-          session.tier === "Pro"
-            ? "Pro size limit is 10GB."
-            : "Free tier is limited to 2GB. Please Log In for 10GB tier!"
-        }`,
+      session?.tier === "Pro"
+        ? 10 * 1024 * 1024 * 1024
+        : 2 * 1024 * 1024 * 1024;
+    if (totalRawSize > limitBytes) {
+      showNotice(
+        `Folder size exceeds limit. ${session?.tier === "Pro" ? "Pro size limit is 10GB." : "Free tier is limited to 2GB. Please Log In for 10GB tier!"}`,
       );
       return;
     }
 
     setUploadProgress({
       active: true,
-      fileName: file.name,
-      percent: 0,
-      speed: "0 KB/s",
-      loaded: `0 MB of ${(file.size / (1024 * 1024)).toFixed(1)} MB`,
+      fileName: `${folderName}.zip`,
+      percent: 15,
+      speed: "Archiving",
+      loaded: `Zipping ${fileItems.length} files...`,
+      statusMessage: `Packing ${fileItems.length} items into compressed archive...`,
+      isFolder: true,
     });
 
-    // Animate upload percentages
+    try {
+      const zipFile = await packageFolderToZip(
+        fileItems,
+        folderName,
+        (zipPercent) => {
+          setUploadProgress((prev) => ({
+            ...prev,
+            percent: Math.min(Math.round(zipPercent * 0.7), 70),
+            statusMessage: `Compressing folder files (${zipPercent}%)...`,
+            loaded: `${zipPercent}% archived`,
+          }));
+        },
+      );
+
+      // Hand off to handleFileUpload to save in database
+      await handleFileUpload(zipFile, true, fileItems.length);
+    } catch (err: any) {
+      console.error("Folder packing error:", err);
+      showNotice(
+        `Folder compression failed: ${err?.message || "Please check folder contents"}`,
+      );
+      setUploadProgress({
+        active: false,
+        fileName: "",
+        percent: 0,
+        speed: "",
+        loaded: "",
+      });
+    }
+  };
+
+  // Perform upload logic with progress animation
+  const handleFileUpload = async (
+    file: File,
+    isFolder = false,
+    fileCount?: number,
+  ) => {
+    // Check max upload limits based on user tier
+    const limitBytes =
+      session?.tier === "Pro"
+        ? 10 * 1024 * 1024 * 1024
+        : 2 * 1024 * 1024 * 1024; // 10GB vs 2GB
+    if (file.size > limitBytes) {
+      showNotice(
+        `File size exceeds limit. ${session?.tier === "Pro" ? "Pro size limit is 10GB." : "Free tier is limited to 2GB. Please Log In for 10GB tier!"}`,
+      );
+      return;
+    }
+
     const totalSizeMB = file.size / (1024 * 1024);
-    let currentPercent = 0;
+    const isAlreadyFolder = isFolder || file.type.includes("is_folder=true");
+
+    setUploadProgress({
+      active: true,
+      fileName: file.name,
+      percent: isAlreadyFolder ? 75 : 10,
+      speed: "Connecting",
+      loaded: `0 MB of ${totalSizeMB.toFixed(1)} MB`,
+      statusMessage: isAlreadyFolder
+        ? "Uploading folder archive to database..."
+        : "Uploading file to database...",
+      isFolder: isAlreadyFolder,
+    });
+
+    let currentPercent = isAlreadyFolder ? 75 : 15;
     const intervalTime = 100;
-    const stepSpeed = Math.max(5, Math.ceil(totalSizeMB / 10)); // adjust increments based on size
 
     const timer = setInterval(async () => {
-      currentPercent += Math.floor(Math.random() * stepSpeed) + 5;
+      currentPercent += Math.floor(Math.random() * 8) + 4;
       if (currentPercent >= 100) {
         clearInterval(timer);
-        setUploadProgress((prev) => ({ ...prev, percent: 100 }));
+        setUploadProgress((prev) => ({
+          ...prev,
+          percent: 100,
+          statusMessage: "Saving to database...",
+        }));
 
         try {
-          // Save file in our client-side storage engine
-          const saved = await saveFile(file);
+          // Save file as public transfer
+          const saved = await saveFile(
+            file,
+            "transfer",
+            isAlreadyFolder,
+            fileCount,
+          );
           setLatestUploadedFile(saved);
+
+          // Optimistically push to active files list so collect view displays immediately
+          setActiveFiles((prev) => [
+            saved,
+            ...prev.filter((f) => f.code !== saved.code),
+          ]);
+
           setUploadProgress({
             active: false,
             fileName: "",
@@ -177,14 +409,12 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
             loaded: "",
           });
           // Auto load files so collect stays synchronized
-          loadFiles();
+          loadFiles(false);
         } catch (err: any) {
           console.error(err);
-          if (err?.message === "SUPABASE_TABLE_MISSING") {
-            setSupabaseSetupNeeded(true);
-          } else {
-            alert(`Upload failed: ${err?.message || err}`);
-          }
+          showNotice(
+            `Upload failed: ${err?.message || "Failed to upload file. Please check connection"}`,
+          );
           setUploadProgress({
             active: false,
             fileName: "",
@@ -205,9 +435,39 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
           percent: currentPercent,
           speed: `${randSpeedMB} MB/s`,
           loaded: `${loadedMB} MB of ${totalSizeMB.toFixed(1)} MB`,
+          statusMessage: isAlreadyFolder
+            ? "Uploading folder archive to database..."
+            : "Uploading to database...",
+          isFolder: isAlreadyFolder,
         });
       }
     }, intervalTime);
+  };
+
+  const handleInspectFolder = async (file: SharedFile) => {
+    setIsInspectingLoading(true);
+    try {
+      let blob = file.data;
+      if (!blob) {
+        const fullFile = await getFile(file.code);
+        if (!fullFile || !fullFile.data) {
+          showNotice("Archive is no longer available or has expired.");
+          setIsInspectingLoading(false);
+          return;
+        }
+        blob = fullFile.data;
+        setActiveFiles((prev) =>
+          prev.map((f) => (f.code === file.code ? { ...f, data: blob } : f)),
+        );
+      }
+      const entries = await inspectZipContents(blob);
+      setInspectingFolder({ name: file.name, entries });
+    } catch (err) {
+      console.error("Could not inspect zip folder:", err);
+      showNotice("Unable to inspect archive contents.");
+    } finally {
+      setIsInspectingLoading(false);
+    }
   };
 
   // Copies code with success toast feedback
@@ -219,9 +479,38 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
     }, 2000);
   };
 
-  // Triggers browser download of a file
-  const handleDownloadFile = (sharedFile: SharedFile) => {
-    const url = URL.createObjectURL(sharedFile.data);
+  // Triggers browser download of a file (fetches binary data on-demand if not preloaded)
+  const handleDownloadFile = async (sharedFile: SharedFile) => {
+    let blob = sharedFile.data;
+    if (!blob) {
+      setDownloadingCode(sharedFile.code);
+      try {
+        const fullFile = await getFile(sharedFile.code);
+        if (!fullFile || !fullFile.data) {
+          showNotice("This file is no longer available or has expired.");
+          setDownloadingCode(null);
+          return;
+        }
+        blob = fullFile.data;
+        // Attach blob in activeFiles state for instant subsequent downloads
+        setActiveFiles((prev) =>
+          prev.map((f) =>
+            f.code === sharedFile.code ? { ...f, data: blob } : f,
+          ),
+        );
+      } catch (err) {
+        console.error("Download error:", err);
+        showNotice(
+          "Failed to download file. Please check your network connection.",
+        );
+        setDownloadingCode(null);
+        return;
+      } finally {
+        setDownloadingCode(null);
+      }
+    }
+
+    const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
     link.download = sharedFile.name;
@@ -321,14 +610,7 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
         }
       } catch (err: any) {
         setIsSearchingCode(false);
-        if (err?.message === "SUPABASE_TABLE_MISSING") {
-          setSupabaseSetupNeeded(true);
-          setSearchError(
-            "Supabase database table is not found. See setup instructions.",
-          );
-        } else {
-          setSearchError("Operational retrieve error. Please try again.");
-        }
+        setSearchError("Operational retrieve error. Please try again.");
       }
     }, 800);
   };
@@ -353,7 +635,14 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
     return `${days}d ${hours}h ${mins}m`;
   };
 
-  const getFileIcon = (fileName: string, fileType: string) => {
+  const getFileIcon = (
+    fileName: string,
+    fileType: string,
+    isFolder?: boolean,
+  ) => {
+    if (isFolder || fileType.includes("is_folder=true")) {
+      return <FolderArchive className="h-8 w-8 text-amber-400" />;
+    }
     const ext = fileName.split(".").pop()?.toLowerCase() || "";
 
     if (["zip", "rar", "7z", "tar", "gz"].includes(ext)) {
@@ -410,88 +699,35 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
       id="transfer-container"
       className="py-12 px-4 sm:px-6 lg:px-8 max-w-4xl mx-auto"
     >
-      {/* Supabase Table Setup Guide Modal */}
+      {/* Floating In-App Notice Banner (Replaces browser pop alerts) */}
       <AnimatePresence>
-        {supabaseSetupNeeded && (
+        {noticeMessage && (
           <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/65 backdrop-blur-sm"
+            initial={{ opacity: 0, y: -20, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -20, scale: 0.95 }}
+            className="fixed top-6 right-6 z-[120] max-w-md px-4 py-3 rounded-2xl shadow-2xl border backdrop-blur-md flex items-center space-x-3 bg-gray-900/95 border-gray-700 text-white"
           >
-            <motion.div
-              initial={{ scale: 0.95, y: 20 }}
-              animate={{ scale: 1, y: 0 }}
-              exit={{ scale: 0.95, y: 20 }}
-              className={`max-w-2xl w-full rounded-3xl shadow-2xl overflow-hidden border p-6 transition-all duration-300 ${
-                darkMode
-                  ? "bg-[#18181c] border-gray-800 text-white"
-                  : "bg-white border-gray-200 text-gray-900"
+            <span
+              className={`p-1.5 rounded-xl ${
+                noticeMessage.type === "success"
+                  ? "bg-emerald-500/20 text-emerald-400"
+                  : noticeMessage.type === "info"
+                    ? "bg-cyan-500/20 text-cyan-400"
+                    : "bg-rose-500/20 text-rose-400"
               }`}
             >
-              <div className="flex items-start space-x-3.5">
-                <div className="p-3 bg-amber-500/10 text-amber-500 rounded-2xl shrink-0">
-                  <AlertCircle className="h-6 w-6" />
-                </div>
-                <div>
-                  <h3 className="text-xl font-extrabold tracking-tight">
-                    Supabase Setup Required
-                  </h3>
-                  <p className="text-sm mt-1 text-gray-500 dark:text-gray-400">
-                    To connect your Sendro Transfer clone with Supabase, you
-                    must create the{" "}
-                    <code className="px-1.5 py-0.5 font-bold font-mono text-xs text-rose-500 bg-rose-500/10 rounded-md">
-                      shared_files
-                    </code>{" "}
-                    table with public policies.
-                  </p>
-                </div>
-              </div>
-
-              <div className="mt-5">
-                <p className="text-xs font-bold uppercase tracking-wider text-gray-400 mb-2">
-                  SQL Schema (Copy and run in your Supabase SQL Editor):
-                </p>
-                <div className="relative">
-                  <pre className="p-4 rounded-2xl bg-gray-950 font-mono text-xs text-green-400 overflow-x-auto max-h-60 border border-gray-800">
-                    {SUPABASE_SETUP_SQL}
-                  </pre>
-                  <button
-                    onClick={() => {
-                      navigator.clipboard.writeText(SUPABASE_SETUP_SQL);
-                      setCopiedSql(true);
-                      setTimeout(() => setCopiedSql(false), 2000);
-                    }}
-                    className="absolute top-2.5 right-2.5 px-3 py-1.5 bg-white/10 hover:bg-white/20 active:scale-95 rounded-xl text-xs font-bold text-white cursor-pointer transition flex items-center space-x-1.5"
-                  >
-                    {copiedSql ? (
-                      <Check className="h-3.5 w-3.5 text-green-400 animate-bounce" />
-                    ) : (
-                      <Copy className="h-3.5 w-3.5 text-gray-300" />
-                    )}
-                    <span>{copiedSql ? "Copied!" : "Copy SQL"}</span>
-                  </button>
-                </div>
-              </div>
-
-              <div className="mt-6 flex justify-end space-x-3">
-                <button
-                  onClick={() => setSupabaseSetupNeeded(false)}
-                  className="px-4 py-2 hover:bg-neutral-800/10 dark:hover:bg-neutral-800 text-sm font-semibold rounded-2xl transition border border-transparent cursor-pointer"
-                >
-                  Close
-                </button>
-                <button
-                  onClick={() => {
-                    setSupabaseSetupNeeded(false);
-                    loadFiles();
-                  }}
-                  className="px-5 py-2.5 text-sm font-extrabold rounded-2xl bg-cyan-500 hover:bg-cyan-600 hover:scale-[1.02] active:scale-[0.98] text-white transition-all shadow-lg shadow-cyan-500/20 cursor-pointer"
-                >
-                  I've Executed the SQL!
-                </button>
-              </div>
-            </motion.div>
+              <AlertCircle className="h-4 w-4" />
+            </span>
+            <p className="text-xs font-semibold text-gray-200 leading-relaxed flex-1">
+              {noticeMessage.text}
+            </p>
+            <button
+              onClick={() => setNoticeMessage(null)}
+              className="p-1 text-gray-400 hover:text-white rounded-lg hover:bg-white/10 transition cursor-pointer"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
           </motion.div>
         )}
       </AnimatePresence>
@@ -505,15 +741,94 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
         id="file-uploader-element"
       />
 
-      {/* Main card box mirroring Sendro image with responsive centering */}
-      <div
-        className={`rounded-3xl border overflow-hidden shadow-2xl transition-all duration-300 ${
-          darkMode
-            ? "bg-[#16161a] border-gray-800 shadow-cyan-500/5"
-            : "bg-white border-gray-200/80 shadow-gray-200"
-        }`}
-      >
-        {/* Banner header mirroring screenshot "Sendro Transfer Share and Convert Files" */}
+      {/* Invisible folder input */}
+      <input
+        ref={folderInputRef}
+        type="file"
+        onChange={handleFolderChange}
+        className="hidden"
+        id="folder-uploader-element"
+      />
+
+      {/* Folder Content Inspection Modal */}
+      <AnimatePresence>
+        {inspectingFolder && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm"
+          >
+            <motion.div
+              initial={{ scale: 0.95, y: 15 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 15 }}
+              className="max-w-lg w-full rounded-3xl shadow-2xl overflow-hidden border p-6 transition-all duration-300 bg-[#18181c] border-gray-800 text-white"
+            >
+              <div className="flex items-center justify-between pb-4 border-b border-gray-500/15">
+                <div className="flex items-center space-x-3 min-w-0">
+                  <div className="p-2.5 rounded-2xl bg-amber-500/10 text-amber-400 shrink-0">
+                    <FolderTree className="h-5 w-5" />
+                  </div>
+                  <div className="truncate">
+                    <h3 className="text-base font-extrabold truncate text-gray-900 dark:text-white">
+                      {inspectingFolder.name}
+                    </h3>
+                    <p className="text-xs text-gray-600 dark:text-gray-400">
+                      {inspectingFolder.entries.length} items preserved in
+                      archive
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setInspectingFolder(null)}
+                  className="p-1.5 rounded-xl hover:bg-gray-500/10 text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-white transition cursor-pointer"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+
+              <div className="mt-4 max-h-72 overflow-y-auto pr-1 space-y-1.5 scrollbar-thin">
+                {inspectingFolder.entries.map((entry, idx) => (
+                  <div
+                    key={idx}
+                    className="flex items-center justify-between p-2 rounded-xl text-xs bg-gray-500/5 border border-gray-500/10 font-mono"
+                  >
+                    <div className="flex items-center space-x-2 min-w-0 truncate">
+                      {entry.isDir ? (
+                        <Folder className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400 shrink-0" />
+                      ) : (
+                        <File className="h-3.5 w-3.5 text-cyan-600 dark:text-cyan-400 shrink-0" />
+                      )}
+                      <span className="truncate text-gray-800 dark:text-gray-300">
+                        {entry.path}
+                      </span>
+                    </div>
+                    {!entry.isDir && (
+                      <span className="text-[10px] text-gray-500 dark:text-gray-400 font-sans shrink-0 ml-2">
+                        {formatBytes(entry.size)}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              <div className="mt-5 flex justify-end">
+                <button
+                  onClick={() => setInspectingFolder(null)}
+                  className="px-5 py-2.5 bg-cyan-500 hover:bg-cyan-400 text-white text-xs font-bold rounded-xl cursor-pointer transition"
+                >
+                  Close Preview
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Main card box mirroring Zapya image with responsive centering */}
+      <div className="rounded-3xl border overflow-hidden shadow-2xl transition-all duration-300 bg-[#16161a] border-gray-800 shadow-cyan-500/5">
+        {/* Banner header mirroring screenshot "Sendro Share and Convert Files" */}
         <div className="bg-gradient-to-r from-cyan-400 to-sky-500 p-6 flex items-center justify-between text-white relative overflow-hidden">
           {/* Subtle logo design */}
           <div className="flex items-center space-x-3 real-logo">
@@ -525,7 +840,7 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
             </div>
             <div>
               <h2 className="font-extrabold text-xl sm:text-2xl tracking-normal">
-                Sendro Transfer
+                Sendro
               </h2>
               <p className="text-xs sm:text-sm text-cyan-50 font-medium">
                 Share and Convert Files securely in real-time
@@ -539,14 +854,8 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
           </div>
         </div>
 
-        {/* Tab switcher inside White-colored frame mirroring original Sendro widget */}
-        <div
-          className={`border-b transition-all duration-300 ${
-            darkMode
-              ? "bg-gray-900 border-gray-800"
-              : "bg-gray-50/50 border-gray-100"
-          }`}
-        >
+        {/* Tab switcher inside frame */}
+        <div className="border-b transition-all duration-300 bg-gray-900 border-gray-800">
           <div className="flex justify-center space-x-8 sm:space-x-12 py-4">
             {(["transfer", "collect", "download"] as TransferSubTab[]).map(
               (tab) => (
@@ -563,13 +872,11 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                   className={`relative py-1 px-3 text-sm font-extrabold tracking-wide uppercase transition-colors duration-150 cursor-pointer ${
                     activeTab === tab
                       ? "text-cyan-500 font-black"
-                      : darkMode
-                        ? "text-gray-400 hover:text-gray-200"
-                        : "text-gray-500 hover:text-gray-800"
+                      : "text-gray-400 hover:text-gray-200"
                   }`}
                 >
                   {tab === "transfer" && "Transfer"}
-                  {tab === "collect" && `Collection (${activeFiles.length})`}
+                  {tab === "collect" && `Collect (${activeFiles.length})`}
                   {tab === "download" && "Download"}
 
                   {activeTab === tab && (
@@ -590,16 +897,262 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
         </div>
 
         {/* Main interactive area inside */}
-        <div
-          className={`p-6 sm:p-10 transition-colors duration-300 min-h-[350px] flex flex-col justify-center ${
-            darkMode ? "bg-[#18181c]" : "bg-white"
-          }`}
-        >
+        <div className="p-6 sm:p-10 transition-colors duration-300 min-h-[350px] flex flex-col justify-center bg-[#18181c]">
           <AnimatePresence mode="wait">
-            {/* TRANSFER VIEW: THE CORE MIRROR LOGIC */}
-            {activeTab === "transfer" &&
-              !uploadProgress.active &&
-              !latestUploadedFile && (
+            {activeTab === "transfer" ? (
+              uploadProgress.active ? (
+                /* PROGRESSING UPLOAD SIMULATOR PANEL */
+                <motion.div
+                  key="upload-progress-panel"
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0 }}
+                  className="flex flex-col justify-center py-6 px-2 sm:px-10"
+                >
+                  <div className="flex items-center space-x-4 mb-4 p-4 rounded-xl border border-gray-200/20 bg-gray-500/5">
+                    <div
+                      className={`h-10 w-10 rounded-full flex items-center justify-center shrink-0 ${
+                        uploadProgress.isFolder
+                          ? "bg-amber-500/15 text-amber-400"
+                          : "bg-cyan-500/10 text-cyan-400"
+                      }`}
+                    >
+                      {uploadProgress.isFolder ? (
+                        <FolderArchive className="h-5 w-5 animate-pulse" />
+                      ) : (
+                        <CloudUpload className="h-5 w-5 animate-bounce" />
+                      )}
+                    </div>
+                    <div className="flex-1 min-w-0 text-left">
+                      <div className="flex items-center space-x-2">
+                        <p className="text-sm font-bold text-gray-900 dark:text-white truncate">
+                          {uploadProgress.fileName}
+                        </p>
+                        {uploadProgress.isFolder && (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-amber-500/20 text-amber-400 border border-amber-500/30 uppercase tracking-wide">
+                            Folder Archive
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                        {uploadProgress.statusMessage ||
+                          "Uploading to secure Supabase database..."}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Main Progress Slide */}
+                  <div className="w-full bg-gray-200 dark:bg-gray-800 h-3.5 rounded-full overflow-hidden mb-3">
+                    <div
+                      className={`h-full transition-all duration-100 ease-out ${
+                        uploadProgress.isFolder
+                          ? "bg-gradient-to-r from-amber-400 to-orange-500"
+                          : "bg-gradient-to-r from-cyan-400 to-blue-500"
+                      }`}
+                      style={{ width: `${uploadProgress.percent}%` }}
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400 font-mono font-bold">
+                    <span>{uploadProgress.speed}</span>
+                    <span
+                      className={`text-sm font-extrabold ${uploadProgress.isFolder ? "text-amber-600 dark:text-amber-400" : "text-cyan-600 dark:text-cyan-400"}`}
+                    >
+                      {uploadProgress.percent}%
+                    </span>
+                    <span>{uploadProgress.loaded}</span>
+                  </div>
+                </motion.div>
+              ) : latestUploadedFile ? (
+                /* UPLOAD SUCCESS SCREEN: SHOW CODES WITH CLIPPING */
+                <motion.div
+                  key="upload-success-panel"
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0 }}
+                  className="pt-2 text-center"
+                >
+                  <div className="inline-flex items-center justify-center p-3.5 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-600 dark:text-emerald-400 mb-5 relative">
+                    <Check className="h-7 w-7 stroke-[2.5]" />
+                    <div className="absolute top-0 right-0 h-2.5 w-2.5 bg-emerald-400 rounded-full animate-ping" />
+                  </div>
+
+                  <h3 className="text-xl sm:text-2xl font-black text-gray-900 dark:text-white mb-1.5">
+                    Locker Configured Successfully
+                  </h3>
+                  <p className="text-xs text-gray-600 dark:text-gray-400 max-w-sm mx-auto mb-8 font-medium">
+                    Similar to Sendro, your file is loaded. Give the retrieval
+                    code below to your target receiver.
+                  </p>
+
+                  {/* THE 6-DIGIT CODE PANEL CARD */}
+                  <div className="p-6 rounded-2xl border max-w-md mx-auto mb-8 flex flex-col items-center justify-center relative group bg-gray-900/60 border-gray-800 shadow-md shadow-black/20">
+                    <label className="text-[10px] font-extrabold text-gray-400 uppercase tracking-widest mb-2.5">
+                      Your Retrieval Code
+                    </label>
+
+                    <div className="flex items-center space-x-2.5 mb-4">
+                      {latestUploadedFile.code.split("").map((digit, index) => (
+                        <div
+                          key={index}
+                          className="h-11 w-10 rounded-xl bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 flex items-center justify-center text-lg font-black font-mono shadow-sm"
+                        >
+                          {digit}
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Action Buttons: Direct Share & Copy Code */}
+                    <div className="flex flex-wrap items-center justify-center gap-2.5">
+                      <button
+                        id="share-file-direct-btn"
+                        onClick={() =>
+                          setSharingFile({
+                            code: latestUploadedFile.code,
+                            name: latestUploadedFile.name,
+                            size: latestUploadedFile.size,
+                            type: latestUploadedFile.type,
+                            isFolder: latestUploadedFile.isFolder,
+                            expiresAt: latestUploadedFile.expiresAt,
+                          })
+                        }
+                        className="flex items-center space-x-1.5 px-5 py-2.5 rounded-xl text-xs font-bold cursor-pointer select-none transition-all duration-150 shadow-md bg-gradient-to-r from-cyan-500 to-blue-500 hover:from-cyan-400 hover:to-blue-400 text-white hover:scale-[1.02]"
+                      >
+                        <Share2 className="h-3.5 w-3.5" />
+                        <span>Share File Directly</span>
+                      </button>
+
+                      <button
+                        id="copy-code-btn"
+                        onClick={() => handleCopyCode(latestUploadedFile.code)}
+                        className="flex items-center space-x-1.5 px-4.5 py-2.5 rounded-xl text-xs font-bold border cursor-pointer select-none transition-all duration-150 shadow-xs bg-gray-800 hover:bg-gray-700 text-gray-200 border-gray-700 hover:scale-[1.02]"
+                      >
+                        {copiedCode === latestUploadedFile.code ? (
+                          <>
+                            <Check className="h-3.5 w-3.5 text-emerald-400" />
+                            <span>Code Copied!</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="h-3.5 w-3.5" />
+                            <span>Copy Code</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Uploaded File Details Panel */}
+                  <div className="p-4 rounded-2xl border max-w-md mx-auto mb-8 flex items-center justify-between text-left bg-gray-900/20 border-gray-800">
+                    <div className="flex items-center space-x-3 truncate">
+                      <div className="shrink-0">
+                        {getFileIcon(
+                          latestUploadedFile.name,
+                          latestUploadedFile.type,
+                          latestUploadedFile.isFolder,
+                        )}
+                      </div>
+                      <div className="truncate pr-3">
+                        <div className="flex items-center space-x-1.5">
+                          <span className="text-[10px] font-bold text-gray-500 dark:text-gray-400 uppercase leading-none">
+                            {latestUploadedFile.isFolder
+                              ? "FOLDER ARCHIVE"
+                              : "UPLOADED FILE"}
+                          </span>
+                          {latestUploadedFile.isFolder && (
+                            <span className="px-1.5 py-0.2 rounded text-[9px] font-black bg-amber-500/20 text-amber-700 dark:text-amber-400 border border-amber-500/30 shrink-0">
+                              FOLDER
+                            </span>
+                          )}
+                        </div>
+                        <h4 className="text-sm font-bold text-gray-800 dark:text-white truncate mt-0.5">
+                          {latestUploadedFile.name}
+                        </h4>
+                        <div className="flex items-center space-x-2 text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                          <span>{formatBytes(latestUploadedFile.size)}</span>
+                          {latestUploadedFile.isFolder && (
+                            <>
+                              <span>•</span>
+                              <button
+                                onClick={() =>
+                                  handleInspectFolder(latestUploadedFile)
+                                }
+                                className="text-amber-400 hover:text-amber-300 font-bold underline cursor-pointer text-[11px]"
+                              >
+                                Inspect files
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="shrink-0 flex items-center space-x-2">
+                      {/* Direct Share on uploaded file */}
+                      <button
+                        onClick={() =>
+                          setSharingFile({
+                            code: latestUploadedFile.code,
+                            name: latestUploadedFile.name,
+                            size: latestUploadedFile.size,
+                            type: latestUploadedFile.type,
+                            isFolder: latestUploadedFile.isFolder,
+                            expiresAt: latestUploadedFile.expiresAt,
+                          })
+                        }
+                        className="flex items-center space-x-1 p-2 bg-cyan-500/10 hover:bg-cyan-500/20 border border-cyan-500/25 text-cyan-400 text-xs rounded-lg font-bold transition duration-150 cursor-pointer"
+                        title="Share File Directly"
+                      >
+                        <Share2 className="h-3.5 w-3.5" />
+                        <span className="hidden sm:inline">Share</span>
+                      </button>
+
+                      {latestUploadedFile.isFolder && (
+                        <button
+                          onClick={() =>
+                            handleInspectFolder(latestUploadedFile)
+                          }
+                          className="p-2 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 text-amber-600 dark:text-amber-400 text-xs rounded-lg font-bold transition duration-150 cursor-pointer"
+                          title="Inspect folder items"
+                        >
+                          <Eye className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                      <button
+                        id="test-download-btn"
+                        onClick={() => handleDownloadFile(latestUploadedFile)}
+                        className="flex items-center space-x-1 p-2 bg-gray-500/5 hover:bg-cyan-500/15 border border-gray-500/10 text-cyan-600 dark:text-cyan-400 text-xs rounded-lg font-bold transition duration-150 cursor-pointer"
+                        title="Pre-test downloader"
+                      >
+                        <Download className="h-3.5 w-3.5" />
+                        <span className="hidden sm:inline">Download</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Expiry warnings */}
+                  <div className="flex items-center justify-center space-x-1.5 text-xs text-amber-600 dark:text-amber-400/90 font-medium mb-8">
+                    <Clock className="h-4 w-4 animate-pulse shrink-0" />
+                    <span>
+                      Link will expire and secure storage wipes in exactly 7
+                      days.
+                    </span>
+                  </div>
+
+                  {/* Action footer */}
+                  <div className="flex justify-center space-x-3 border-t border-gray-200/30 pt-6">
+                    <button
+                      id="upload-another-btn"
+                      onClick={() => setLatestUploadedFile(null)}
+                      className="flex items-center space-x-1.5 px-4.5 py-2.5 rounded-xl text-xs font-bold bg-[#808080]/5 hover:bg-[#808080]/10 text-gray-800 dark:text-white border border-gray-500/10 cursor-pointer transition duration-150"
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" />
+                      <span>Upload Another File</span>
+                    </button>
+                  </div>
+                </motion.div>
+              ) : (
+                /* TRANSFER VIEW: THE CORE MIRROR LOGIC */
                 <motion.div
                   key="transfer-main"
                   initial={{ opacity: 0, y: 10 }}
@@ -612,12 +1165,47 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                   className={`relative rounded-2xl border-2 border-dashed p-6 sm:p-10 text-center flex flex-col items-center justify-center transition-all ${
                     dragActive
                       ? "border-cyan-400 bg-cyan-500/5 scale-[0.99] shadow-inner"
-                      : darkMode
-                        ? "border-gray-800 hover:border-gray-700 bg-gray-900/10"
-                        : "border-gray-200 hover:border-cyan-200 bg-gray-50/30"
+                      : "border-gray-800 hover:border-gray-700 bg-gray-900/10"
                   }`}
                 >
-                  {/* Simulated circle buttons mirroring Sendro visual layout exactly */}
+                  {/* Workspace Integration Banner */}
+                  {session?.isLoggedIn ? (
+                    <div className="w-full max-w-md mx-auto mb-4 px-4 py-2.5 rounded-2xl bg-cyan-500/10 border border-cyan-500/25 flex items-center justify-between text-xs">
+                      <div className="flex items-center space-x-2 text-left truncate">
+                        <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse shrink-0" />
+                        <span className="text-gray-700 dark:text-gray-300 truncate">
+                          Linked:{" "}
+                          <strong className="text-gray-900 dark:text-white">
+                            {session?.workspaceName || "Personal Workspace"}
+                          </strong>
+                        </span>
+                      </div>
+                      {onNavigateToWorkspace && (
+                        <button
+                          onClick={onNavigateToWorkspace}
+                          className="text-cyan-600 dark:text-cyan-400 hover:text-cyan-700 dark:hover:text-cyan-300 font-bold underline cursor-pointer ml-3 shrink-0"
+                        >
+                          Open Locker →
+                        </button>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="w-full max-w-md mx-auto mb-4 px-4 py-2 rounded-2xl bg-gray-500/5 border border-gray-500/15 flex items-center justify-between text-xs">
+                      <span className="text-gray-600 dark:text-gray-400 text-left">
+                        Want a private 10GB personal locker?
+                      </span>
+                      {openLoginModal && (
+                        <button
+                          onClick={() => openLoginModal(true)}
+                          className="text-cyan-600 dark:text-cyan-400 hover:text-cyan-700 dark:hover:text-cyan-300 font-bold hover:underline cursor-pointer ml-2 shrink-0"
+                        >
+                          Create Workspace →
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Simulated circle buttons mirroring Zapya visual layout exactly */}
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-10 sm:gap-14 my-6 py-2 items-center justify-center">
                     {/* Left circle: UPLOAD NODE */}
                     <div
@@ -627,18 +1215,10 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                     >
                       <div className="relative h-32 w-32 sm:h-36 sm:w-36 rounded-full bg-gradient-to-tr from-cyan-400 to-blue-500 flex items-center justify-center text-white shadow-lg shadow-cyan-400/20 group-hover:shadow-cyan-400/40 group-hover:scale-[1.04] transition-all duration-300">
                         <CloudUpload className="h-14 w-14 sm:h-16 sm:w-16 stroke-[1.8]" />
-
-                        {/* Interactive pulsing radar waves */}
                         <div className="absolute inset-0 rounded-full border border-cyan-400/30 animate-ping pointer-events-none scale-105 duration-2000" />
                       </div>
-                      <span
-                        className={`mt-4 text-xs font-bold uppercase tracking-widest ${
-                          darkMode
-                            ? "text-gray-400 group-hover:text-cyan-400"
-                            : "text-gray-500 group-hover:text-blue-600"
-                        }`}
-                      >
-                        Drag & Drop or Click
+                      <span className="mt-4 text-xs font-bold uppercase tracking-widest text-gray-400 group-hover:text-cyan-400">
+                        Drag & Drop File or Folder
                       </span>
                     </div>
 
@@ -647,27 +1227,14 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                       id="receive-circle-trigger"
                       onClick={() => {
                         setActiveTab("download");
-                        // Focus first index digitsbox next cycle
                         setTimeout(() => inputRefs.current[0]?.focus(), 100);
                       }}
                       className="flex flex-col items-center cursor-pointer group"
                     >
-                      <div
-                        className={`h-32 w-32 sm:h-36 sm:w-36 rounded-full border-4 flex items-center justify-center shadow-md dark:shadow-black/20 group-hover:scale-[1.04] transition-all duration-300 ${
-                          darkMode
-                            ? "border-cyan-500/60 hover:border-cyan-400 text-cyan-400 bg-gray-900"
-                            : "border-cyan-400 hover:border-cyan-500 text-cyan-500 bg-white"
-                        }`}
-                      >
+                      <div className="h-32 w-32 sm:h-36 sm:w-36 rounded-full border-4 flex items-center justify-center shadow-md dark:shadow-black/20 group-hover:scale-[1.04] transition-all duration-300 border-cyan-500/60 hover:border-cyan-400 text-cyan-400 bg-gray-900">
                         <CloudDownload className="h-14 w-14 sm:h-16 sm:w-16 stroke-[1.8]" />
                       </div>
-                      <span
-                        className={`mt-4 text-xs font-bold uppercase tracking-widest ${
-                          darkMode
-                            ? "text-gray-400 group-hover:text-cyan-400"
-                            : "text-gray-500 group-hover:text-cyan-500"
-                        }`}
-                      >
+                      <span className="mt-4 text-xs font-bold uppercase tracking-widest text-gray-400 group-hover:text-cyan-400">
                         Redeem 6-Digit Code
                       </span>
                     </div>
@@ -675,19 +1242,28 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
 
                   {/* Sub-label explaining standard limits */}
                   <p className="text-xs text-gray-400 leading-normal max-w-sm mb-6">
-                    {session.isLoggedIn
-                      ? `Pro Account Active: Upload files up to 10GB.`
+                    {session?.isLoggedIn
+                      ? `Pro Account Active: Upload files & folders up to 10GB.`
                       : `Guest Account Mode: Upload up to 2GB. Log In to unlock 10GB.`}
                   </p>
 
-                  {/* Bottom Pill Buttons mirroring Sendro screenshot perfectly */}
-                  <div className="flex flex-col sm:flex-row space-y-3 sm:space-y-0 sm:space-x-5 w-full max-w-md">
+                  {/* Pill Buttons with Upload File, Upload Folder, and Receive File */}
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 w-full max-w-lg">
                     <button
-                      id="quick-upload-pill"
+                      id="quick-upload-file-pill"
                       onClick={triggerFileSelect}
-                      className="flex-1 py-3 text-sm font-black text-center text-white bg-gradient-to-r from-cyan-400 to-blue-500 hover:from-cyan-300 hover:to-blue-400 rounded-full shadow-lg shadow-cyan-400/10 cursor-pointer active:scale-[0.98] transition-transform"
+                      className="flex items-center justify-center space-x-1.5 py-3 px-3 text-xs font-black text-center text-white bg-gradient-to-r from-cyan-500 to-blue-500 hover:from-cyan-400 hover:to-blue-400 rounded-full shadow-lg shadow-cyan-400/15 cursor-pointer active:scale-[0.98] transition-all"
                     >
-                      Upload File
+                      <Upload className="h-4 w-4 shrink-0" />
+                      <span>Upload File</span>
+                    </button>
+                    <button
+                      id="quick-upload-folder-pill"
+                      onClick={triggerFolderSelect}
+                      className="flex items-center justify-center space-x-1.5 py-3 px-3 text-xs font-black text-center text-amber-300 hover:text-white bg-amber-500/15 hover:bg-amber-500/90 border border-amber-500/40 hover:border-amber-400 rounded-full shadow-lg shadow-amber-500/10 cursor-pointer active:scale-[0.98] transition-all"
+                    >
+                      <Folder className="h-4 w-4 shrink-0" />
+                      <span>Upload Folder</span>
                     </button>
                     <button
                       id="quick-receive-pill"
@@ -695,187 +1271,15 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                         setActiveTab("download");
                         setTimeout(() => inputRefs.current[0]?.focus(), 150);
                       }}
-                      className={`flex-1 py-3 text-sm font-extrabold text-center rounded-full border-2 cursor-pointer active:scale-[0.98] transition-transform ${
-                        darkMode
-                          ? "border-cyan-500 text-cyan-400 hover:bg-cyan-500/5 bg-transparent"
-                          : "border-cyan-400 text-cyan-500 hover:bg-cyan-50/40 bg-transparent"
-                      }`}
+                      className="flex items-center justify-center space-x-1.5 py-3 px-3 text-xs font-extrabold text-center rounded-full border-2 cursor-pointer active:scale-[0.98] transition-all border-cyan-500/60 text-cyan-400 hover:bg-cyan-500/10 bg-transparent"
                     >
-                      Receive File
+                      <CloudDownload className="h-4 w-4 shrink-0" />
+                      <span>Receive File</span>
                     </button>
                   </div>
                 </motion.div>
-              )}
-
-            {/* PROGRESSING UPLOAD SIMULATOR PANEL */}
-            {uploadProgress.active && (
-              <motion.div
-                key="upload-progress-panel"
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0 }}
-                className="flex flex-col justify-center py-6 px-2 sm:px-10"
-              >
-                <div className="flex items-center space-x-4 mb-4 p-4 rounded-xl border border-gray-200/20 bg-gray-500/5">
-                  <div className="h-10 w-10 bg-cyan-500/10 text-cyan-400 rounded-full flex items-center justify-center shrink-0">
-                    <CloudUpload className="h-5 w-5 animate-bounce" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-bold text-gray-900 dark:text-white truncate">
-                      {uploadProgress.fileName}
-                    </p>
-                    <p className="text-xs text-gray-500 dark:text-gray-400">
-                      Uploading to secure browser memory sandbox...
-                    </p>
-                  </div>
-                </div>
-
-                {/* Main Progress Slide */}
-                <div className="w-full bg-gray-200 dark:bg-gray-800 h-3.5 rounded-full overflow-hidden mb-3">
-                  <div
-                    className="bg-gradient-to-r from-cyan-400 to-blue-500 h-full transition-all duration-100 ease-out"
-                    style={{ width: `${uploadProgress.percent}%` }}
-                  />
-                </div>
-
-                <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400 font-mono font-bold">
-                  <span>{uploadProgress.speed}</span>
-                  <span className="text-sm text-cyan-500 font-extrabold">
-                    {uploadProgress.percent}%
-                  </span>
-                  <span>{uploadProgress.loaded}</span>
-                </div>
-              </motion.div>
-            )}
-
-            {/* UPLOAD SUCCESS SCREEN: SHOW CODES WITH CLIPPING */}
-            {latestUploadedFile && !uploadProgress.active && (
-              <motion.div
-                key="upload-success-panel"
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0 }}
-                className="pt-2 text-center"
-              >
-                <div className="inline-flex items-center justify-center p-3.5 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 mb-5 relative">
-                  <Check className="h-7 w-7 stroke-[2.5]" />
-                  <div className="absolute top-0 right-0 h-2.5 w-2.5 bg-emerald-400 rounded-full animate-ping" />
-                </div>
-
-                <h3 className="text-xl sm:text-2xl font-black text-gray-900 dark:text-white mb-1.5">
-                  Locker Configured Successfully
-                </h3>
-                <p className="text-xs text-gray-500 dark:text-gray-400 max-w-sm mx-auto mb-8 font-medium">
-                  Similar to Sendro Transfer, your file is loaded. Give the
-                  retrieval code below to your target receiver.
-                </p>
-
-                {/* THE 6-DIGIT CODE PANEL CARD */}
-                <div
-                  className={`p-6 rounded-2xl border max-w-md mx-auto mb-8 flex flex-col items-center justify-center relative group ${
-                    darkMode
-                      ? "bg-gray-900/60 border-gray-800 shadow-md shadow-black/20"
-                      : "bg-gray-50 border-gray-200"
-                  }`}
-                >
-                  <label className="text-[10px] font-extrabold text-gray-400 uppercase tracking-widest mb-2.5">
-                    Your Retrieval Code
-                  </label>
-
-                  <div className="flex items-center space-x-2.5 mb-4">
-                    {latestUploadedFile.code.split("").map((digit, index) => (
-                      <div
-                        key={index}
-                        className="h-11 w-10 rounded-xl bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 flex items-center justify-center text-lg font-black font-mono shadow-sm"
-                      >
-                        {digit}
-                      </div>
-                    ))}
-                  </div>
-
-                  {/* Copy Button */}
-                  <button
-                    id="copy-code-btn"
-                    onClick={() => handleCopyCode(latestUploadedFile.code)}
-                    className="flex items-center space-x-1.5 px-4.5 py-2.5 rounded-xl text-xs font-bold border cursor-pointer select-none transition-all duration-150 shadow-xs bg-cyan-500 text-white border-cyan-500 hover:bg-cyan-400 hover:scale-[1.02]"
-                  >
-                    {copiedCode === latestUploadedFile.code ? (
-                      <>
-                        <Check className="h-3.5 w-3.5" />
-                        <span>Code Copied!</span>
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="h-3.5 w-3.5" />
-                        <span>Copy Shareable Code</span>
-                      </>
-                    )}
-                  </button>
-                </div>
-
-                {/* Uploaded File Details Panel */}
-                <div
-                  className={`p-4 rounded-xl border max-w-md mx-auto mb-8 flex items-center justify-between text-left ${
-                    darkMode
-                      ? "bg-gray-900/20 border-gray-800"
-                      : "bg-white border-gray-100"
-                  }`}
-                >
-                  <div className="flex items-center space-x-3 truncate">
-                    <div className="shrink-0">
-                      {getFileIcon(
-                        latestUploadedFile.name,
-                        latestUploadedFile.type,
-                      )}
-                    </div>
-                    <div className="truncate pr-4">
-                      <span className="text-xs font-semibold text-gray-400 leading-none">
-                        UPLOADED FILE
-                      </span>
-                      <h4 className="text-sm font-bold text-gray-800 dark:text-white truncate">
-                        {latestUploadedFile.name}
-                      </h4>
-                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                        {formatBytes(latestUploadedFile.size)}
-                      </p>
-                    </div>
-                  </div>
-
-                  <button
-                    id="test-download-btn"
-                    onClick={() => handleDownloadFile(latestUploadedFile)}
-                    className="shrink-0 flex items-center space-x-1 p-2 bg-gray-500/5 hover:bg-cyan-500/15 border border-gray-500/10 text-cyan-400 text-xs rounded-lg font-bold transition duration-150 cursor-pointer"
-                    title="Pre-test downloader"
-                  >
-                    <Download className="h-3.5 w-3.5" />
-                    <span className="hidden sm:inline">Download</span>
-                  </button>
-                </div>
-
-                {/* Expiry warnings */}
-                <div className="flex items-center justify-center space-x-1.5 text-xs text-amber-500/90 font-medium mb-8">
-                  <Clock className="h-4 w-4 animate-pulse shrink-0" />
-                  <span>
-                    Link will expire and secure storage wipes in exactly 7 days.
-                  </span>
-                </div>
-
-                {/* Action footer */}
-                <div className="flex justify-center space-x-3 border-t border-gray-200/30 pt-6">
-                  <button
-                    id="upload-another-btn"
-                    onClick={() => setLatestUploadedFile(null)}
-                    className="flex items-center space-x-1.5 px-4.5 py-2.5 rounded-xl text-xs font-bold bg-[#808080]/5 hover:bg-[#808080]/10 text-gray-800 dark:text-white border border-gray-500/10 cursor-pointer transition duration-150"
-                  >
-                    <RotateCcw className="h-3.5 w-3.5" />
-                    <span>Upload Another File</span>
-                  </button>
-                </div>
-              </motion.div>
-            )}
-
-            {/* COLLECT PANEL: DIRECTORIES HISTORY */}
-            {activeTab === "collect" && (
+              )
+            ) : activeTab === "collect" ? (
               <motion.div
                 key="collect-panel"
                 initial={{ opacity: 0 }}
@@ -883,15 +1287,28 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                 exit={{ opacity: 0 }}
                 className="w-full"
               >
-                {activeFiles.length === 0 ? (
+                {isCollectLoading && activeFiles.length === 0 ? (
+                  <div className="text-center py-14 px-4 flex flex-col items-center justify-center space-y-3">
+                    <div className="h-14 w-14 rounded-full bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 flex items-center justify-center border border-cyan-500/20">
+                      <Loader2 className="h-6 w-6 animate-spin" />
+                    </div>
+                    <h4 className="font-bold text-gray-900 dark:text-white text-sm">
+                      Retrieving active transfers...
+                    </h4>
+                    <p className="text-xs text-gray-600 dark:text-gray-400 max-w-xs leading-relaxed">
+                      Connecting to database to quickly fetch shared link
+                      directory.
+                    </p>
+                  </div>
+                ) : activeFiles.length === 0 ? (
                   <div className="text-center py-10 px-4">
-                    <div className="h-16 w-16 rounded-full bg-cyan-500/5 border border-cyan-500/10 text-cyan-400 flex items-center justify-center mx-auto mb-4 animate-pulse">
+                    <div className="h-16 w-16 rounded-full bg-cyan-500/5 border border-cyan-500/10 text-cyan-600 dark:text-cyan-400 flex items-center justify-center mx-auto mb-4 animate-pulse">
                       <CloudUpload className="h-8 w-8 stroke-[1.5]" />
                     </div>
                     <h4 className="font-extrabold text-gray-900 dark:text-white text-base">
                       No Active Shared Transfers
                     </h4>
-                    <p className="text-xs text-gray-400 max-w-sm mx-auto mt-1 mb-6 leading-relaxed">
+                    <p className="text-xs text-gray-600 dark:text-gray-400 max-w-sm mx-auto mt-1 mb-6 leading-relaxed">
                       You haven't uploaded files onto this browser sandbox
                       recently. Once you upload, active files list here.
                     </p>
@@ -906,10 +1323,10 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                 ) : (
                   <div className="space-y-4">
                     <div className="flex justify-between items-center px-1 mb-2">
-                      <span className="text-xs font-bold text-gray-400 uppercase tracking-widest">
+                      <span className="text-xs font-bold text-gray-600 dark:text-gray-400 uppercase tracking-widest">
                         ACTIVE TRANSFERS ({activeFiles.length})
                       </span>
-                      <span className="text-[10px] text-cyan-405 font-bold tracking-normal flex items-center space-x-1">
+                      <span className="text-[10px] text-cyan-600 dark:text-cyan-400 font-bold tracking-normal flex items-center space-x-1">
                         <Info className="h-3.5 w-3.5 shrink-0" />
                         <span>All files clear dynamically in 7 days</span>
                       </span>
@@ -919,21 +1336,24 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                       {activeFiles.map((file) => (
                         <div
                           key={file.code}
-                          className={`p-3 rounded-xl border flex flex-col sm:flex-row sm:items-center sm:justify-between whitespace-nowrap gap-3 ${
-                            darkMode
-                              ? "bg-gray-900/50 border-gray-800/80 hover:border-gray-700 hover:bg-gray-800/20"
-                              : "bg-gray-50/50 border-gray-200/80 hover:border-gray-300 hover:bg-white"
-                          } transition-all duration-150`}
+                          className="p-3 rounded-xl border flex flex-col sm:flex-row sm:items-center sm:justify-between whitespace-nowrap gap-3 bg-gray-900/50 border-gray-800/80 hover:border-gray-700 hover:bg-gray-800/20 transition-all duration-150"
                         >
                           {/* File Label Block */}
                           <div className="flex items-center space-x-3 min-w-0 pr-4">
                             <div className="shrink-0">
-                              {getFileIcon(file.name, file.type)}
+                              {getFileIcon(file.name, file.type, file.isFolder)}
                             </div>
                             <div className="truncate text-left">
-                              <h4 className="text-sm font-bold text-gray-900 dark:text-white truncate">
-                                {file.name}
-                              </h4>
+                              <div className="flex items-center space-x-1.5">
+                                <h4 className="text-sm font-bold text-white truncate">
+                                  {file.name}
+                                </h4>
+                                {file.isFolder && (
+                                  <span className="px-1.5 py-0.2 rounded text-[9px] font-black bg-amber-500/20 text-amber-400 border border-amber-500/30 shrink-0">
+                                    FOLDER
+                                  </span>
+                                )}
+                              </div>
                               <div className="flex items-center space-x-2 text-[10px] text-gray-400 font-semibold mt-0.5">
                                 <span>{formatBytes(file.size)}</span>
                                 <span>•</span>
@@ -953,15 +1373,24 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
 
                           {/* Control Block */}
                           <div className="flex items-center justify-end space-x-2 pl-1 sm:pl-0">
+                            {/* Inspect Folder items if folder */}
+                            {file.isFolder && (
+                              <button
+                                onClick={() => handleInspectFolder(file)}
+                                className="p-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 rounded-lg border border-amber-500/20 transition duration-150 cursor-pointer"
+                                title="Inspect folder files"
+                              >
+                                <Eye className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+
                             {/* Copy Code button */}
                             <button
                               onClick={() => handleCopyCode(file.code)}
                               className={`p-2 rounded-lg border text-xs font-bold flex items-center space-x-1 transition duration-150 cursor-pointer ${
                                 copiedCode === file.code
                                   ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-400"
-                                  : darkMode
-                                    ? "bg-gray-800 border-gray-700 hover:text-cyan-400 hover:border-cyan-500/30 text-gray-400"
-                                    : "bg-white border-gray-200 hover:text-cyan-500 hover:border-cyan-400/30 text-gray-600"
+                                  : "bg-gray-800 border-gray-700 hover:text-cyan-400 hover:border-cyan-500/30 text-gray-400"
                               }`}
                               title="Copy sharing code"
                             >
@@ -977,22 +1406,44 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                               </span>
                             </button>
 
-                            {/* Direct Download */}
+                            {/* Direct Share on Active File */}
                             <button
-                              onClick={() => handleDownloadFile(file)}
-                              className="p-2 bg-cyan-500 hover:bg-cyan-400 text-white rounded-lg cursor-pointer transition duration-150"
-                              title="Download File"
+                              onClick={() =>
+                                setSharingFile({
+                                  code: file.code,
+                                  name: file.name,
+                                  size: file.size,
+                                  type: file.type,
+                                  isFolder: file.isFolder,
+                                  expiresAt: file.expiresAt,
+                                })
+                              }
+                              className="p-2 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-600 dark:text-cyan-400 rounded-lg border border-cyan-500/25 transition duration-150 cursor-pointer flex items-center space-x-1"
+                              title="Share File Directly"
                             >
-                              <Download className="h-3.5 w-3.5" />
+                              <Share2 className="h-3.5 w-3.5" />
+                              <span className="hidden md:inline text-xs font-bold">
+                                Share
+                              </span>
                             </button>
 
-                            {/* Delete File */}
+                            {/* Direct Download */}
                             <button
-                              // onClick={() => handleDeleteFile(file.code)}
-                              className="p-2 bg-rose-500/10 hover:bg-rose-500 text-rose-400 hover:text-white rounded-lg border border-rose-500/20 hover:border-rose-500 transition duration-150 cursor-pointer"
-                              title="Delete File Upload"
+                              id={`download-file-${file.code}`}
+                              onClick={() => handleDownloadFile(file)}
+                              disabled={downloadingCode === file.code}
+                              className="p-2 bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 text-white rounded-lg cursor-pointer transition duration-150 flex items-center justify-center min-w-[32px] min-h-[32px]"
+                              title={
+                                file.isFolder
+                                  ? "Download Zip Folder"
+                                  : "Download File"
+                              }
                             >
-                              <Trash2 className="h-3.5 w-3.5" />
+                              {downloadingCode === file.code ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                <Download className="h-3.5 w-3.5" />
+                              )}
                             </button>
                           </div>
                         </div>
@@ -1001,10 +1452,8 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                   </div>
                 )}
               </motion.div>
-            )}
-
-            {/* DOWNLOAD CODEX REDEEM PANEL */}
-            {activeTab === "download" && (
+            ) : activeTab === "download" ? (
+              /* DOWNLOAD CODEX REDEEM PANEL */
               <motion.div
                 key="download-panel"
                 initial={{ opacity: 0 }}
@@ -1021,14 +1470,13 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                     <h3 className="text-xl font-extrabold text-gray-900 dark:text-white mb-2">
                       Enter Download Code
                     </h3>
-                    <p className="text-xs text-gray-400 mb-6 font-medium">
-                      Similar to Sendro Transfer, insert the 6-digit
-                      numeric/letter code shared with you to claim the binary
-                      locker.
+                    <p className="text-xs text-gray-600 dark:text-gray-400 mb-6 font-medium">
+                      Similar to Sendro, insert the 6-digit numeric/letter code
+                      shared with you to claim the binary locker.
                     </p>
 
                     {searchError && (
-                      <div className="mb-5 p-3.5 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-400 text-xs font-semibold flex items-start space-x-2 text-left">
+                      <div className="mb-5 p-3.5 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-600 dark:text-rose-400 text-xs font-semibold flex items-start space-x-2 text-left">
                         <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
                         <span>{searchError}</span>
                       </div>
@@ -1043,6 +1491,14 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                             inputRefs.current[index] = el;
                           }}
                           type="text"
+                          name={`zapya-code-${index}`}
+                          id={`zapya-code-${index}`}
+                          autoComplete="off"
+                          autoCorrect="off"
+                          autoCapitalize="off"
+                          spellCheck={false}
+                          data-lpignore="true"
+                          data-form-type="other"
                           inputMode="numeric"
                           maxLength={1}
                           pattern="[0-9]*"
@@ -1052,11 +1508,7 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                           }
                           onKeyDown={(e) => handleDigitKeyDown(index, e)}
                           onPaste={index === 0 ? handlePaste : undefined}
-                          className={`h-14 w-12 sm:h-16 sm:w-14 rounded-2xl border-2 text-center text-xl sm:text-2xl font-extrabold font-mono focus:outline-none focus:ring-2 focus:ring-cyan-400/55 focus:border-cyan-500 transition-all duration-150 ${
-                            darkMode
-                              ? "bg-gray-900 border-gray-800 text-cyan-400"
-                              : "bg-gray-50 border-gray-200 text-blue-600"
-                          }`}
+                          className="h-14 w-12 sm:h-16 sm:w-14 rounded-2xl border-2 text-center text-xl sm:text-2xl font-extrabold font-mono focus:outline-none focus:ring-2 focus:ring-cyan-400/55 focus:border-cyan-500 transition-all duration-150 bg-gray-900 border-gray-800 text-cyan-400"
                         />
                       ))}
                     </div>
@@ -1099,48 +1551,57 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                     </div>
 
                     {/* Document Panel Box */}
-                    <div
-                      className={`p-5 rounded-2xl border mb-6 flex items-center justify-between text-left ${
-                        darkMode
-                          ? "bg-gray-900/60 border-gray-800 shadow-md"
-                          : "bg-gray-50 border-gray-200"
-                      }`}
-                    >
+                    <div className="p-5 rounded-2xl border mb-6 flex items-center justify-between text-left bg-gray-900/60 border-gray-800 shadow-md">
                       <div className="flex items-center space-x-3 min-w-0 pr-4">
                         <div className="shrink-0">
-                          {getFileIcon(foundFile.name, foundFile.type)}
+                          {getFileIcon(
+                            foundFile.name,
+                            foundFile.type,
+                            foundFile.isFolder,
+                          )}
                         </div>
                         <div className="truncate">
-                          <h4 className="text-sm font-bold text-gray-900 dark:text-white truncate">
-                            {foundFile.name}
-                          </h4>
-                          <div className="flex items-center space-x-2 text-[10px] text-gray-400 font-bold mt-1">
+                          <div className="flex items-center space-x-1.5">
+                            <h4 className="text-sm font-bold text-gray-900 dark:text-white truncate">
+                              {foundFile.name}
+                            </h4>
+                            {foundFile.isFolder && (
+                              <span className="px-1.5 py-0.2 rounded text-[9px] font-black bg-amber-500/20 text-amber-700 dark:text-amber-400 border border-amber-500/30 shrink-0">
+                                FOLDER ARCHIVE
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center space-x-2 text-[10px] text-gray-500 dark:text-gray-400 font-bold mt-1">
                             <span>{formatBytes(foundFile.size)}</span>
                             <span>•</span>
-                            <span className="text-cyan-400 font-mono text-xs">
+                            <span className="text-cyan-600 dark:text-cyan-400 font-mono text-xs">
                               {foundFile.code}
                             </span>
                           </div>
                         </div>
                       </div>
+
+                      {foundFile.isFolder && (
+                        <button
+                          onClick={() => handleInspectFolder(foundFile)}
+                          className="shrink-0 flex items-center space-x-1.5 px-3 py-1.5 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 text-amber-700 dark:text-amber-400 text-xs rounded-xl font-bold transition cursor-pointer"
+                        >
+                          <Eye className="h-3.5 w-3.5" />
+                          <span>Inspect</span>
+                        </button>
+                      )}
                     </div>
 
                     {/* Warnings and expiry block */}
-                    <div
-                      className={`p-3.5 rounded-xl border text-xs flex items-start space-x-2 mb-8 ${
-                        darkMode
-                          ? "bg-amber-500/5 border-amber-500/25 text-amber-500/90"
-                          : "bg-amber-50 border-amber-100/90 text-amber-700"
-                      }`}
-                    >
+                    <div className="p-3.5 rounded-xl border text-xs flex items-start space-x-2 mb-8 bg-amber-500/5 border-amber-500/25 text-amber-500/90">
                       <CalendarDays className="h-4 w-4 shrink-0 mt-0.5 animate-pulse" />
                       <div>
                         <span className="font-bold">
                           Temporal Storage Active:
                         </span>
                         <p className="mt-0.5 leading-relaxed">
-                          This file will be completely wiped from browser disk
-                          sandbox in exactly{" "}
+                          This file will be completely wiped from database in
+                          exactly{" "}
                           <span className="font-extrabold">
                             {getRemainingTimeStr(foundFile.expiresAt)}
                           </span>
@@ -1157,7 +1618,30 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                         className="flex items-center justify-center space-x-2 py-4 w-full bg-gradient-to-r from-emerald-500 to-teal-600 hover:opacity-90 font-bold rounded-2xl text-white shadow-lg cursor-pointer select-none active:scale-[0.99] transition duration-150"
                       >
                         <Download className="h-5 w-5" />
-                        <span>Download Original File</span>
+                        <span>
+                          {foundFile.isFolder
+                            ? "Download Complete Folder (.zip)"
+                            : "Download Original File"}
+                        </span>
+                      </button>
+
+                      {/* Direct Share on Redeemed File */}
+                      <button
+                        id="share-redeemed-file-btn"
+                        onClick={() =>
+                          setSharingFile({
+                            code: foundFile.code,
+                            name: foundFile.name,
+                            size: foundFile.size,
+                            type: foundFile.type,
+                            isFolder: foundFile.isFolder,
+                            expiresAt: foundFile.expiresAt,
+                          })
+                        }
+                        className="flex items-center justify-center space-x-2 py-3 w-full bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-600 dark:text-cyan-400 border border-cyan-500/25 font-bold rounded-2xl text-xs cursor-pointer transition duration-150"
+                      >
+                        <Share2 className="h-4 w-4" />
+                        <span>Share File Link with Others</span>
                       </button>
 
                       <button
@@ -1166,7 +1650,7 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                           setFoundFile(null);
                           setCodeDigits(Array(6).fill(""));
                         }}
-                        className="flex items-center justify-center space-x-1 py-3 w-full text-xs font-bold text-gray-400 hover:text-cyan-400 cursor-pointer transition duration-150"
+                        className="flex items-center justify-center space-x-1 py-2 w-full text-xs font-bold text-gray-600 dark:text-gray-400 hover:text-cyan-600 dark:hover:text-cyan-400 cursor-pointer transition duration-150"
                       >
                         <RotateCcw className="h-3.5 w-3.5" />
                         <span>Redeem Another Code</span>
@@ -1175,10 +1659,17 @@ export default function TransferView({ darkMode, session }: TransferViewProps) {
                   </div>
                 )}
               </motion.div>
-            )}
+            ) : null}
           </AnimatePresence>
         </div>
       </div>
+
+      {/* Share Modal Dialog */}
+      <AnimatePresence>
+        {sharingFile && (
+          <ShareModal file={sharingFile} onClose={() => setSharingFile(null)} />
+        )}
+      </AnimatePresence>
     </div>
   );
 }
