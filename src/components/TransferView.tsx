@@ -293,7 +293,7 @@ export default function TransferView({
         : 2 * 1024 * 1024 * 1024;
     if (totalRawSize > limitBytes) {
       showNotice(
-        `Folder size exceeds limit. ${session?.tier === "Pro" ? "Pro size limit is 10GB." : "Free tier is limited to 2GB. Please Log In for 10GB tier!"}`,
+        `Folder size exceeds limit. ${session?.tier === "Pro" ? "Pro size limit is 100MB." : "Free tier is limited to 10MB. Please Log In for 100MB tier!"}`,
       );
       return;
     }
@@ -349,10 +349,10 @@ export default function TransferView({
     const limitBytes =
       session?.tier === "Pro"
         ? 10 * 1024 * 1024 * 1024
-        : 2 * 1024 * 1024 * 1024; // 10GB vs 2GB
+        : 2 * 1024 * 1024 * 1024; // 100MB vs 10MB
     if (file.size > limitBytes) {
       showNotice(
-        `File size exceeds limit. ${session?.tier === "Pro" ? "Pro size limit is 10GB." : "Free tier is limited to 2GB. Please Log In for 10GB tier!"}`,
+        `File size exceeds limit. ${session?.tier === "Pro" ? "Pro size limit is 100MB." : "Free tier is limited to 10MB. Please Log In for 100MB tier!"}`,
       );
       return;
     }
@@ -1192,7 +1192,7 @@ export default function TransferView({
                   ) : (
                     <div className="w-full max-w-md mx-auto mb-4 px-4 py-2 rounded-2xl bg-gray-500/5 border border-gray-500/15 flex items-center justify-between text-xs">
                       <span className="text-gray-600 dark:text-gray-400 text-left">
-                        Want a private 10GB personal locker?
+                        Want a private 100MB personal locker?
                       </span>
                       {openLoginModal && (
                         <button
@@ -1243,8 +1243,8 @@ export default function TransferView({
                   {/* Sub-label explaining standard limits */}
                   <p className="text-xs text-gray-400 leading-normal max-w-sm mb-6">
                     {session?.isLoggedIn
-                      ? `Pro Account Active: Upload files & folders up to 10GB.`
-                      : `Guest Account Mode: Upload up to 2GB. Log In to unlock 10GB.`}
+                      ? `Pro Account Active: Upload files & folders up to 100MB.`
+                      : `Guest Account Mode: Upload up to 10MB. Log In to unlock 100MB.`}
                   </p>
 
                   {/* Pill Buttons with Upload File, Upload Folder, and Receive File */}

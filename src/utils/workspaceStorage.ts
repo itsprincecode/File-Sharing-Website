@@ -40,13 +40,6 @@ export interface WorkspaceData {
  * Load persisted user session from localStorage
  */
 export function loadSavedSession(): UserSession {
-  // Sync any cached accounts to Supabase database in the background
-  try {
-    syncCachedMembersToDatabase().catch(() => {});
-  } catch {
-    // Ignore background sync errors
-  }
-
   try {
     const raw = localStorage.getItem(SESSION_KEY);
     if (!raw) return DEFAULT_USER_SESSION;
@@ -78,6 +71,110 @@ export function clearSessionFromStorage(): void {
   } catch (err) {
     console.warn("Could not clear session:", err);
   }
+}
+
+/**
+ * Verifies if the active user session still exists in Supabase.
+ * If the user or workspace was deleted from Supabase (e.g. by SQL query),
+ * automatically clears the local session, purges local workspace caches,
+ * and returns null so the website immediately updates to the logged-out, clean state.
+ */
+export async function validateSessionAgainstSupabase(): Promise<UserSession | null> {
+  const currentSession = loadSavedSession();
+  if (!currentSession || !currentSession.isLoggedIn || !currentSession.email) {
+    return null;
+  }
+
+  try {
+    const { data: member, error } = await supabase
+      .from("workspace_members")
+      .select("email, workspace_id, workspace_name, display_name")
+      .eq("email", currentSession.email.toLowerCase())
+      .maybeSingle();
+
+    // If query succeeded and member does NOT exist in Supabase -> user was deleted from DB
+    if (!error && !member) {
+      console.log(
+        "Member was removed from Supabase. Clearing local session and workspace cache.",
+      );
+      clearSessionFromStorage();
+      const allWorkspaces = getAllWorkspaces();
+      if (
+        currentSession.workspaceId &&
+        allWorkspaces[currentSession.workspaceId]
+      ) {
+        delete allWorkspaces[currentSession.workspaceId];
+        saveAllWorkspaces(allWorkspaces);
+      }
+      const users = getRegisteredUsers().filter(
+        (u) => u.email.toLowerCase() !== currentSession.email.toLowerCase(),
+      );
+      saveRegisteredUsers(users);
+      return null;
+    }
+
+    if (member) {
+      const updatedSession: UserSession = {
+        ...currentSession,
+        workspaceId: member.workspace_id || currentSession.workspaceId,
+        workspaceName: member.workspace_name || currentSession.workspaceName,
+        displayName: member.display_name || currentSession.displayName,
+      };
+      saveSessionToStorage(updatedSession);
+      return updatedSession;
+    }
+  } catch (err) {
+    console.warn("Could not validate session against Supabase:", err);
+  }
+
+  return currentSession;
+}
+
+/**
+ * FACTORY RESET: Completely clears all workspaces, files, and members
+ * from both Supabase AND local browser storage.
+ */
+export async function factoryResetAllData(): Promise<{
+  success: boolean;
+  error?: string;
+}> {
+  try {
+    // 1. Delete all rows from Supabase
+    await supabase.from("workspace_files").delete().neq("code", "__never__");
+    await supabase.from("workspaces").delete().neq("id", "__never__");
+    await supabase.from("workspace_members").delete().neq("email", "__never__");
+    await supabase.from("shared_files").delete().neq("code", "__never__");
+
+    // 2. Wipe all local browser storage
+    try {
+      localStorage.removeItem(SESSION_KEY);
+      localStorage.removeItem(USERS_KEY);
+      localStorage.removeItem(WORKSPACES_KEY);
+      localStorage.clear();
+    } catch (e) {
+      console.warn("Error clearing localStorage:", e);
+    }
+
+    return { success: true };
+  } catch (err: any) {
+    console.error("Factory reset failed:", err);
+    return {
+      success: false,
+      error: err?.message || "Failed to reset database",
+    };
+  }
+}
+
+// Bind to window object for convenient browser console execution
+if (typeof window !== "undefined") {
+  (window as any).__FACTORY_RESET_ALL__ = factoryResetAllData;
+  (window as any).__CLEAR_LOCAL_CACHE__ = () => {
+    try {
+      localStorage.clear();
+      sessionStorage.clear();
+    } catch {}
+    window.location.reload();
+  };
 }
 
 /**
@@ -134,111 +231,144 @@ export function isValidUuid(val?: string | null): boolean {
   );
 }
 
+let isSyncingMembers = false;
+let lastSyncTimestamp = 0;
+
 /**
- * Automatically syncs any locally stored member accounts, lockers, and files into Supabase database.
- * Ensures workspace_members, workspaces, and workspace_files rows are all populated.
+ * Automatically syncs any locally stored member accounts and lockers into Supabase database.
+ * Throttled to avoid rapid duplicate background calls.
  */
 export async function syncCachedMembersToDatabase(): Promise<void> {
-  const users = getRegisteredUsers();
-  const allWorkspaces = getAllWorkspaces();
-  if (!users || users.length === 0) return;
+  const now = Date.now();
+  if (isSyncingMembers || now - lastSyncTimestamp < 30000) return;
+  isSyncingMembers = true;
+  lastSyncTimestamp = now;
 
-  let hasIdUpdates = false;
+  try {
+    const users = getRegisteredUsers();
+    const allWorkspaces = getAllWorkspaces();
 
-  for (const u of users) {
-    try {
-      if (!isValidUuid(u.id)) {
-        u.id = generateUuid();
-        hasIdUpdates = true;
+    // Query existing members from Supabase as the source of truth
+    const { data: dbMembers, error: dbErr } = await supabase
+      .from("workspace_members")
+      .select("email, id, workspace_id");
+
+    if (!dbErr) {
+      // If Supabase workspace_members table is completely empty, it means the database was wiped or factory reset!
+      // In this case, NEVER re-insert old deleted accounts or old data!
+      if (!dbMembers || dbMembers.length === 0) {
+        console.log(
+          "Supabase workspace_members is empty. Purging stale local cache to match clean database.",
+        );
+        saveRegisteredUsers([]);
+        saveAllWorkspaces({});
+        clearSessionFromStorage();
+        return;
       }
 
-      // 1. Sync member record to Supabase
-      const memberPayload: any = {
-        id: u.id,
-        workspace_id: u.workspaceId,
-        email: u.email,
-        display_name: u.displayName || "Member",
-        workspace_name: u.workspaceName || "Personal Workspace",
-        password: u.password || null,
-        password_hash: u.passwordHash,
-        updated_at: Date.now(),
-      };
-
-      const { error: memberErr } = await supabase
-        .from("workspace_members")
-        .upsert(memberPayload, { onConflict: "email" });
-
-      if (memberErr) {
-        console.warn("Could not sync member to Supabase:", memberErr.message);
+      // Prune any local user whose account was deleted from Supabase
+      const dbEmailSet = new Set(
+        dbMembers.map((m: any) => (m.email || "").toLowerCase()),
+      );
+      const activeUsers = users.filter((u) =>
+        dbEmailSet.has(u.email.toLowerCase()),
+      );
+      if (activeUsers.length !== users.length) {
+        saveRegisteredUsers(activeUsers);
       }
 
-      // 2. Sync corresponding workspace record to Supabase
-      const ws = allWorkspaces[u.workspaceId];
-      const nowIso = new Date().toISOString();
-      const wsPayload: any = {
-        workspace_id: u.workspaceId,
-        name: u.workspaceName || ws?.name || "Personal Workspace",
-        owner_email: u.email,
-        folders: ws?.folders || [],
-        storage_limit_bytes: ws?.storageLimitBytes || 10737418240,
-        created_at: nowIso,
-        updated_at: nowIso,
-      };
-
-      const { error: wsErr } = await supabase
-        .from("workspaces")
-        .upsert(wsPayload, { onConflict: "workspace_id" });
-
-      if (wsErr) {
-        console.warn("Could not sync workspace to Supabase:", wsErr.message);
-      }
-
-      // 3. Sync files for this workspace to workspace_files
-      if (ws && Array.isArray(ws.files) && ws.files.length > 0) {
-        for (const file of ws.files) {
-          try {
-            const { data: existingFile } = await supabase
-              .from("workspace_files")
-              .select("id")
-              .eq("workspace_id", u.workspaceId)
-              .eq("code", file.code)
-              .maybeSingle();
-
-            const filePayload: any = {
-              id: existingFile?.id || generateUuid(),
-              workspace_id: u.workspaceId,
-              owner_email: u.email,
-              code: file.code,
-              name: file.name,
-              size: file.size,
-              type: file.type,
-              folder_id: file.folderId || "all",
-              is_folder: !!file.isFolder,
-              file_count: file.fileCount || 1,
-              is_paused: !!file.isPaused,
-              paused_remaining_ms: file.pausedRemainingMs || 0,
-              uploaded_at: new Date(
-                file.uploadedAt || Date.now(),
-              ).toISOString(),
-              expires_at: new Date(
-                file.expiresAt || Date.now() + 86400000,
-              ).toISOString(),
-              base64_data: (file as any).base64Data || null,
-            };
-
-            await supabase.from("workspace_files").upsert(filePayload);
-          } catch (fileErr) {
-            console.warn("Could not sync file to Supabase:", fileErr);
-          }
+      // Also prune any cached workspaces whose owner no longer exists in Supabase
+      let wsModified = false;
+      for (const [wsId, ws] of Object.entries(allWorkspaces)) {
+        if (ws.ownerEmail && !dbEmailSet.has(ws.ownerEmail.toLowerCase())) {
+          delete allWorkspaces[wsId];
+          wsModified = true;
         }
       }
-    } catch (err) {
-      console.warn("Error during background sync of member:", err);
-    }
-  }
+      if (wsModified) {
+        saveAllWorkspaces(allWorkspaces);
+      }
 
-  if (hasIdUpdates) {
-    saveRegisteredUsers(users);
+      // If active session user no longer exists in Supabase, clear session immediately
+      const currentSession = loadSavedSession();
+      if (
+        currentSession?.isLoggedIn &&
+        currentSession.email &&
+        !dbEmailSet.has(currentSession.email.toLowerCase())
+      ) {
+        console.log(
+          "Current session user was deleted from Supabase. Logging out.",
+        );
+        clearSessionFromStorage();
+      }
+    }
+
+    if (!users || users.length === 0) return;
+
+    let hasIdUpdates = false;
+
+    for (const u of users) {
+      try {
+        if (!isValidUuid(u.id)) {
+          u.id = generateUuid();
+          hasIdUpdates = true;
+        }
+
+        // 1. Sync member record to Supabase
+        const memberPayload: any = {
+          id: u.id,
+          workspace_id: u.workspaceId,
+          email: u.email,
+          display_name: u.displayName || "Member",
+          workspace_name: u.workspaceName || "Personal Workspace",
+          password: u.password || null,
+          password_hash: u.passwordHash,
+          updated_at: Date.now(),
+        };
+
+        const { error: memberErr } = await supabase
+          .from("workspace_members")
+          .upsert(memberPayload, { onConflict: "email" });
+
+        if (memberErr) {
+          console.warn("Could not sync member to Supabase:", memberErr.message);
+        }
+
+        // 2. Sync corresponding workspace record to Supabase
+        const ws = allWorkspaces[u.workspaceId];
+        const nowEpoch = Date.now();
+        const wsPayload: any = {
+          id: u.workspaceId,
+          workspace_id: u.workspaceId,
+          name: u.workspaceName || ws?.name || "Personal Workspace",
+          owner_email: u.email,
+          folders: ws?.folders || [],
+          storage_limit_bytes: ws?.storageLimitBytes || 10737418240,
+          created_at: nowEpoch,
+          updated_at: nowEpoch,
+        };
+
+        let { error: wsErr } = await supabase
+          .from("workspaces")
+          .upsert(wsPayload, { onConflict: "id" });
+
+        if (wsErr) {
+          delete wsPayload.created_at;
+          delete wsPayload.updated_at;
+          await supabase
+            .from("workspaces")
+            .upsert(wsPayload, { onConflict: "id" });
+        }
+      } catch (err) {
+        console.warn("Error during background sync of member:", err);
+      }
+    }
+
+    if (hasIdUpdates) {
+      saveRegisteredUsers(users);
+    }
+  } finally {
+    isSyncingMembers = false;
   }
 }
 
@@ -247,18 +377,7 @@ const SAMPLE_NAMES = new Set([
   "Workspace_Onboarding_Guide.pdf",
   "Brand_Design_Assets.zip",
 ]);
-export const PREDEFINED_FOLDER_IDS = new Set([
-  "docs",
-  "media",
-  "archives",
-  "all",
-]);
-export const PREDEFINED_FOLDER_NAMES = new Set([
-  "Documents",
-  "Media Assets",
-  "Archives & Backups",
-  "All Files",
-]);
+export const PREDEFINED_FOLDER_IDS = new Set(["docs", "media", "archives"]);
 
 /**
  * Helper to get all workspace data objects from local cache
@@ -270,35 +389,36 @@ export function getAllWorkspaces(): Record<string, WorkspaceData> {
     const parsed = JSON.parse(raw) as Record<string, WorkspaceData>;
     let hasChanges = false;
 
-    // Purge sample files and any pre-defined default folders from all workspaces
+    // Deduplicate files by unique file code, purge sample files, and normalize folder structure
     for (const ws of Object.values(parsed)) {
       if (Array.isArray(ws.files)) {
         const origLen = ws.files.length;
-        ws.files = ws.files.filter(
-          (f) => !SAMPLE_CODES.has(f.code) && !SAMPLE_NAMES.has(f.name),
-        );
+        const seenCodes = new Set<string>();
+        const uniqueFiles: WorkspaceFileMetadata[] = [];
+
         for (const file of ws.files) {
-          if (file.folderId && PREDEFINED_FOLDER_IDS.has(file.folderId)) {
-            file.folderId = "all";
-            hasChanges = true;
+          if (!file || !file.code) continue;
+          if (SAMPLE_CODES.has(file.code) || SAMPLE_NAMES.has(file.name))
+            continue;
+          if (!seenCodes.has(file.code)) {
+            seenCodes.add(file.code);
+            if (!file.folderId) {
+              file.folderId = "all";
+            }
+            uniqueFiles.push(file);
           }
         }
+
+        ws.files = uniqueFiles;
         if (ws.files.length !== origLen) {
           hasChanges = true;
         }
       }
 
-      // Remove pre-defined folders so only user-created folders remain
-      if (Array.isArray(ws.folders)) {
-        const origFolderLen = ws.folders.length;
-        ws.folders = ws.folders.filter(
-          (f) =>
-            !PREDEFINED_FOLDER_IDS.has(f.id) &&
-            !PREDEFINED_FOLDER_NAMES.has(f.name),
-        );
-        if (ws.folders.length !== origFolderLen) {
-          hasChanges = true;
-        }
+      // Ensure folders array exists and retains all valid user-created folders
+      if (!Array.isArray(ws.folders)) {
+        ws.folders = [];
+        hasChanges = true;
       }
     }
 
@@ -507,19 +627,27 @@ export async function loginMember(
       // Ensure their workspace exists in Supabase
       const allWs = getAllWorkspaces();
       const ws = allWs[localUser.workspaceId];
-      const nowIso = new Date().toISOString();
-      await supabase.from("workspaces").upsert(
-        {
-          workspace_id: localUser.workspaceId,
-          name: localUser.workspaceName || "Personal Workspace",
-          owner_email: localUser.email,
-          folders: ws?.folders || [],
-          storage_limit_bytes: ws?.storageLimitBytes || 10737418240,
-          created_at: nowIso,
-          updated_at: nowIso,
-        },
-        { onConflict: "workspace_id" },
-      );
+      const nowEpoch = Date.now();
+      const wsPayload: any = {
+        id: localUser.workspaceId,
+        workspace_id: localUser.workspaceId,
+        name: localUser.workspaceName || "Personal Workspace",
+        owner_email: localUser.email,
+        folders: ws?.folders || [],
+        storage_limit_bytes: ws?.storageLimitBytes || 10737418240,
+        created_at: nowEpoch,
+        updated_at: nowEpoch,
+      };
+      let { error: wsUpsertErr } = await supabase
+        .from("workspaces")
+        .upsert(wsPayload, { onConflict: "id" });
+      if (wsUpsertErr) {
+        delete wsPayload.created_at;
+        delete wsPayload.updated_at;
+        await supabase
+          .from("workspaces")
+          .upsert(wsPayload, { onConflict: "id" });
+      }
     } catch (migrationErr) {
       console.warn("Could not sync local user to Supabase:", migrationErr);
     }
@@ -638,22 +766,25 @@ export async function registerMember(
   }
 
   // 2. Insert into Supabase workspaces table
-  const nowIso = new Date().toISOString();
+  const nowEpoch = Date.now();
+  const wsRecord: any = {
+    id: workspaceId,
+    workspace_id: workspaceId,
+    name: finalWsName,
+    owner_email: normalizedEmail,
+    folders: defaultFolders,
+    storage_limit_bytes: 10 * 1024 * 1024 * 1024,
+    created_at: nowEpoch,
+    updated_at: nowEpoch,
+  };
   try {
-    const { error: insertWsErr } = await supabase.from("workspaces").upsert(
-      {
-        workspace_id: workspaceId,
-        name: finalWsName,
-        owner_email: normalizedEmail,
-        folders: defaultFolders,
-        storage_limit_bytes: 10 * 1024 * 1024 * 1024,
-        created_at: nowIso,
-        updated_at: nowIso,
-      },
-      { onConflict: "workspace_id" },
-    );
+    let { error: insertWsErr } = await supabase
+      .from("workspaces")
+      .upsert(wsRecord, { onConflict: "id" });
     if (insertWsErr) {
-      console.warn("Supabase workspace insert warning:", insertWsErr.message);
+      delete wsRecord.created_at;
+      delete wsRecord.updated_at;
+      await supabase.from("workspaces").upsert(wsRecord, { onConflict: "id" });
     }
   } catch (err) {
     console.warn("Could not insert workspace into Supabase:", err);
@@ -769,22 +900,21 @@ export async function fetchWorkspaceFromSupabase(
 ): Promise<WorkspaceData | null> {
   if (!workspaceId) return null;
 
+  const allWorkspaces = getAllWorkspaces();
+  let existingWs = allWorkspaces[workspaceId];
+
   let workspaceRecord: any = null;
   let workspaceFiles: any[] = [];
 
   try {
     // 1. Fetch workspace row (support id or workspace_id column)
-    let wsData: any = null;
     let wsRes = await supabase
       .from("workspaces")
       .select("*")
       .eq("id", workspaceId)
       .maybeSingle();
 
-    if (
-      wsRes.error &&
-      (wsRes.error.code === "42703" || wsRes.error.code === "PGRST204")
-    ) {
+    if (wsRes.error || !wsRes.data) {
       wsRes = await supabase
         .from("workspaces")
         .select("*")
@@ -796,6 +926,37 @@ export async function fetchWorkspaceFromSupabase(
       workspaceRecord = wsRes.data;
     }
 
+    // Also fallback to workspace_members to get member's updated workspace_name if workspaces table didn't return it
+    if ((!workspaceRecord || !workspaceRecord.name) && ownerEmail) {
+      const { data: memberData } = await supabase
+        .from("workspace_members")
+        .select("workspace_name, display_name")
+        .eq("email", ownerEmail.toLowerCase())
+        .maybeSingle();
+
+      if (memberData && memberData.workspace_name) {
+        if (!workspaceRecord) {
+          workspaceRecord = {
+            id: workspaceId,
+            name: memberData.workspace_name,
+            owner_email: ownerEmail,
+            folders: [],
+          };
+        } else {
+          workspaceRecord.name = memberData.workspace_name;
+        }
+      }
+    }
+
+    // Self-heal: If workspaces table doesn't have the parent record, ensure it exists now
+    if (!wsRes.data && (workspaceRecord || existingWs)) {
+      ensureWorkspaceInSupabase(
+        workspaceId,
+        ownerEmail,
+        workspaceRecord?.name || existingWs?.name,
+      ).catch(() => {});
+    }
+
     // 2. Fetch workspace files (support created_at, uploaded_at or client-side sorting)
     let filesRes = await supabase
       .from("workspace_files")
@@ -803,10 +964,7 @@ export async function fetchWorkspaceFromSupabase(
       .eq("workspace_id", workspaceId)
       .order("created_at", { ascending: false });
 
-    if (
-      filesRes.error &&
-      (filesRes.error.code === "42703" || filesRes.error.code === "PGRST204")
-    ) {
+    if (filesRes.error) {
       filesRes = await supabase
         .from("workspace_files")
         .select("*")
@@ -814,10 +972,7 @@ export async function fetchWorkspaceFromSupabase(
         .order("uploaded_at", { ascending: false });
     }
 
-    if (
-      filesRes.error &&
-      (filesRes.error.code === "42703" || filesRes.error.code === "PGRST204")
-    ) {
+    if (filesRes.error) {
       filesRes = await supabase
         .from("workspace_files")
         .select("*")
@@ -831,66 +986,296 @@ export async function fetchWorkspaceFromSupabase(
     console.warn("Supabase workspace query warning:", err);
   }
 
-  // Sync to local cache
-  const allWorkspaces = getAllWorkspaces();
-  let existingWs = allWorkspaces[workspaceId];
-
-  if (workspaceRecord) {
-    const cleanFolders = (
-      Array.isArray(workspaceRecord.folders) ? workspaceRecord.folders : []
-    ).filter(
-      (f: any) =>
-        !PREDEFINED_FOLDER_IDS.has(f?.id) &&
-        !PREDEFINED_FOLDER_NAMES.has(f?.name),
-    );
-
-    const formattedFiles: WorkspaceFileMetadata[] = workspaceFiles.map(
-      (row) => {
-        let fId = row.folder_id || "all";
-        if (PREDEFINED_FOLDER_IDS.has(fId)) {
-          fId = "all";
-        }
-        return {
-          code: row.code,
-          name: row.name,
-          size: row.size,
-          type: row.type,
-          folderId: fId,
-          uploadedAt: toEpochMs(row.created_at || row.uploaded_at),
-          expiresAt: toEpochMs(row.expires_at),
-          isFolder: !!row.is_folder,
-          fileCount: row.file_count || 1,
-          isPaused: !!row.is_paused,
-          pausedRemainingMs: row.paused_remaining_ms,
-        };
-      },
-    );
-
-    // Ensure sorted newest first
-    formattedFiles.sort((a, b) => b.uploadedAt - a.uploadedAt);
-
-    const synced: WorkspaceData = {
-      id: workspaceRecord.id || workspaceRecord.workspace_id || workspaceId,
-      name: workspaceRecord.name,
-      ownerEmail: workspaceRecord.owner_email || ownerEmail || "",
-      folders: cleanFolders,
-      files: formattedFiles,
-      storageLimitBytes:
-        workspaceRecord.storage_limit_bytes ||
-        workspaceRecord.limit_bytes ||
-        10 * 1024 * 1024 * 1024,
-    };
-
-    allWorkspaces[workspaceId] = synced;
+  // If the workspace does not exist in Supabase at all (e.g., administrator deleted it),
+  // purge local cache and return null so the website immediately clears the deleted data.
+  if (!workspaceRecord && !ownerEmail) {
+    delete allWorkspaces[workspaceId];
     saveAllWorkspaces(allWorkspaces);
-    return synced;
+    return null;
   }
 
-  return existingWs || null;
+  // Folder synchronization logic - always preserve custom folders
+  let finalFolders: WorkspaceFolder[] = [];
+  if (
+    workspaceRecord &&
+    Array.isArray(workspaceRecord.folders) &&
+    workspaceRecord.folders.length > 0
+  ) {
+    finalFolders = workspaceRecord.folders.filter(
+      (f: any) => f && f.id && f.name,
+    );
+  } else if (
+    existingWs &&
+    Array.isArray(existingWs.folders) &&
+    existingWs.folders.length > 0
+  ) {
+    finalFolders = existingWs.folders.filter((f: any) => f && f.id && f.name);
+  }
+
+  // Files synchronization logic - strictly deduplicate and maintain folder_id
+  const seenFileCodes = new Set<string>();
+  let finalFiles: WorkspaceFileMetadata[] = [];
+  let foundDuplicateRows = false;
+
+  if (workspaceFiles && workspaceFiles.length > 0) {
+    for (const row of workspaceFiles) {
+      if (!row || !row.code) continue;
+      if (seenFileCodes.has(row.code)) {
+        foundDuplicateRows = true;
+        continue;
+      }
+      seenFileCodes.add(row.code);
+
+      const fId = row.folder_id && row.folder_id.trim() ? row.folder_id : "all";
+      finalFiles.push({
+        code: row.code,
+        name: row.name,
+        size: Number(row.size) || 0,
+        type: row.type || "application/octet-stream",
+        folderId: fId,
+        uploadedAt: toEpochMs(row.created_at || row.uploaded_at),
+        expiresAt: toEpochMs(row.expires_at),
+        isFolder: !!row.is_folder,
+        fileCount: row.file_count || 1,
+        isPaused: !!row.is_paused,
+        pausedRemainingMs: row.paused_remaining_ms,
+      });
+    }
+  }
+
+  // If duplicate records were detected in Supabase, prune them in the background
+  if (foundDuplicateRows) {
+    cleanupDuplicateWorkspaceFiles(workspaceId).catch(() => {});
+  }
+
+  // Ensure sorted newest first
+  finalFiles.sort((a, b) => (b.uploadedAt || 0) - (a.uploadedAt || 0));
+
+  const synced: WorkspaceData = {
+    id: workspaceRecord?.id || workspaceRecord?.workspace_id || workspaceId,
+    name: workspaceRecord?.name || existingWs?.name || "Personal Workspace",
+    ownerEmail:
+      workspaceRecord?.owner_email ||
+      ownerEmail ||
+      existingWs?.ownerEmail ||
+      "",
+    folders: finalFolders,
+    files: finalFiles,
+    storageLimitBytes:
+      workspaceRecord?.storage_limit_bytes ||
+      workspaceRecord?.limit_bytes ||
+      existingWs?.storageLimitBytes ||
+      10 * 1024 * 1024 * 1024,
+  };
+
+  allWorkspaces[workspaceId] = synced;
+  saveAllWorkspaces(allWorkspaces);
+  return synced;
+}
+
+let isCleaningDuplicates = false;
+
+/**
+ * Automatically purges all duplicate rows in Supabase workspace_files,
+ * keeping only the single newest row for each unique (workspace_id, code) pair.
+ */
+export async function cleanupDuplicateWorkspaceFiles(
+  workspaceId?: string,
+): Promise<number> {
+  if (isCleaningDuplicates) return 0;
+  isCleaningDuplicates = true;
+
+  try {
+    let query = supabase.from("workspace_files").select("*");
+
+    if (workspaceId) {
+      query = query.eq("workspace_id", workspaceId);
+    }
+
+    const { data: rows, error } = await query;
+    if (error || !rows || rows.length === 0) return 0;
+
+    // Group files by workspace_id + '::' + code
+    const groups = new Map<string, Array<{ id: string; time: number }>>();
+    for (const r of rows) {
+      if (!r || !r.code || !r.id) continue;
+      const key = `${r.workspace_id || "default"}::${r.code}`;
+      const time = toEpochMs(r.created_at || r.uploaded_at);
+      if (!groups.has(key)) {
+        groups.set(key, []);
+      }
+      groups.get(key)!.push({ id: r.id, time });
+    }
+
+    const idsToDelete: string[] = [];
+    for (const [_key, list] of groups.entries()) {
+      if (list.length > 1) {
+        // Sort newest first
+        list.sort((a, b) => b.time - a.time);
+        // Keep index 0, mark all other duplicates for deletion
+        for (let i = 1; i < list.length; i++) {
+          idsToDelete.push(list[i].id);
+        }
+      }
+    }
+
+    if (idsToDelete.length === 0) return 0;
+
+    // Delete duplicates in batches of 50
+    let totalPurged = 0;
+    for (let i = 0; i < idsToDelete.length; i += 50) {
+      const chunk = idsToDelete.slice(i, i + 50);
+      const { error: delErr } = await supabase
+        .from("workspace_files")
+        .delete()
+        .in("id", chunk);
+
+      if (!delErr) {
+        totalPurged += chunk.length;
+      }
+    }
+
+    return totalPurged;
+  } catch (err) {
+    console.warn("Notice during workspace_files deduplication:", err);
+    return 0;
+  } finally {
+    isCleaningDuplicates = false;
+  }
 }
 
 /**
- * Save workspace file to Supabase database workspace_files table
+ * Ensure workspace record exists in the Supabase 'workspaces' table.
+ * This guarantees any foreign key constraint (e.g., workspace_files_workspace_id_fkey)
+ * on workspace_files(workspace_id) references an existing parent row.
+ */
+export async function ensureWorkspaceInSupabase(
+  workspaceId: string,
+  ownerEmail?: string,
+  workspaceName?: string,
+  forceInsert: boolean = false,
+): Promise<boolean> {
+  if (!workspaceId) return false;
+
+  try {
+    if (!forceInsert) {
+      // Check if row already exists in workspaces table
+      const { data: existingRows } = await supabase
+        .from("workspaces")
+        .select("id")
+        .eq("id", workspaceId)
+        .limit(1);
+
+      if (existingRows && existingRows.length > 0) {
+        return true;
+      }
+    }
+
+    const allWs = getAllWorkspaces();
+    const localWs = allWs[workspaceId];
+    const email = (
+      ownerEmail ||
+      localWs?.ownerEmail ||
+      "member@transfer.app"
+    ).toLowerCase();
+    const name = workspaceName || localWs?.name || "Personal Workspace";
+    const folders = localWs?.folders || [
+      { id: "all", name: "All Files", color: "indigo", createdAt: Date.now() },
+      {
+        id: "docs",
+        name: "Documents",
+        color: "emerald",
+        createdAt: Date.now(),
+      },
+      {
+        id: "media",
+        name: "Media & Photos",
+        color: "amber",
+        createdAt: Date.now(),
+      },
+      {
+        id: "archives",
+        name: "Archives",
+        color: "purple",
+        createdAt: Date.now(),
+      },
+    ];
+    const storageLimit = localWs?.storageLimitBytes || 10737418240;
+    const nowEpoch = Date.now();
+    const nowIso = new Date().toISOString();
+
+    const candidatePayloads: any[] = [
+      // 1. Full with id, workspace_id and bigint epoch
+      {
+        id: workspaceId,
+        workspace_id: workspaceId,
+        name,
+        owner_email: email,
+        folders,
+        storage_limit_bytes: storageLimit,
+        created_at: nowEpoch,
+        updated_at: nowEpoch,
+      },
+      // 2. Full with id, workspace_id and ISO timestamptz
+      {
+        id: workspaceId,
+        workspace_id: workspaceId,
+        name,
+        owner_email: email,
+        folders,
+        storage_limit_bytes: storageLimit,
+        created_at: nowIso,
+        updated_at: nowIso,
+      },
+      // 3. With id and workspace_id without timestamps
+      {
+        id: workspaceId,
+        workspace_id: workspaceId,
+        name,
+        owner_email: email,
+        folders,
+        storage_limit_bytes: storageLimit,
+      },
+      // 4. Minimal with id
+      {
+        id: workspaceId,
+        name,
+        owner_email: email,
+        folders,
+      },
+      // 5. Minimal with workspace_id
+      {
+        workspace_id: workspaceId,
+        name,
+        owner_email: email,
+        folders,
+      },
+    ];
+
+    for (const p of candidatePayloads) {
+      const { error: insErr } = await supabase
+        .from("workspaces")
+        .upsert(p as any, { onConflict: "id" });
+      if (!insErr || insErr.code === "23505") {
+        return true;
+      }
+      const { error: directInsErr } = await supabase
+        .from("workspaces")
+        .insert(p as any);
+      if (!directInsErr || directInsErr.code === "23505") {
+        return true;
+      }
+    }
+  } catch (err) {
+    console.warn("Notice: could not ensure workspace row in Supabase:", err);
+  }
+
+  return false;
+}
+
+/**
+ * Save workspace file to Supabase database workspace_files table.
+ * Guaranteed to prevent duplicate rows by finding any existing records first.
  */
 export async function saveWorkspaceFileToSupabase(
   workspaceId: string,
@@ -898,50 +1283,224 @@ export async function saveWorkspaceFileToSupabase(
   fileMeta: WorkspaceFileMetadata,
   base64Data?: string,
 ): Promise<void> {
-  // 1. Add to local cache immediately
+  if (!workspaceId) return;
+
+  // 1. Add to local cache immediately with exact folderId
   addFileToWorkspace(workspaceId, fileMeta);
 
-  // 2. Save to Supabase workspace_files table
-  try {
-    const uploadedAtIso = new Date(fileMeta.uploadedAt).toISOString();
-    const expiresAtIso = new Date(fileMeta.expiresAt).toISOString();
+  // 2. Ensure parent workspace exists in Supabase to satisfy foreign key constraints
+  await ensureWorkspaceInSupabase(workspaceId, ownerEmail);
 
-    const { data: existing } = await supabase
+  // 3. Save to Supabase workspace_files table
+  try {
+    const uploadedAtMs = fileMeta.uploadedAt || Date.now();
+    const expiresAtMs =
+      fileMeta.expiresAt || uploadedAtMs + 7 * 24 * 60 * 60 * 1000;
+    const uploadedAtIso = new Date(uploadedAtMs).toISOString();
+    const expiresAtIso = new Date(expiresAtMs).toISOString();
+    const targetFolderId = fileMeta.folderId || "all";
+
+    // Query without maybeSingle to avoid PGRST116 multiple-rows error
+    const { data: existingRows } = await supabase
       .from("workspace_files")
       .select("id")
       .eq("workspace_id", workspaceId)
-      .eq("code", fileMeta.code)
-      .maybeSingle();
+      .eq("code", fileMeta.code);
 
-    const filePayload: any = {
-      id: existing?.id || generateUuid(),
+    let rowId: string;
+    if (existingRows && existingRows.length > 0) {
+      rowId = existingRows[0].id;
+      // If duplicate rows already exist in Supabase for this file, purge them now
+      if (existingRows.length > 1) {
+        const extraIds = existingRows.slice(1).map((r) => r.id);
+        Promise.resolve(
+          supabase.from("workspace_files").delete().in("id", extraIds),
+        ).catch(() => {});
+      }
+    } else {
+      rowId = generateUuid();
+    }
+
+    // Base payload without timestamp columns
+    const basePayload: Record<string, any> = {
       workspace_id: workspaceId,
       owner_email: ownerEmail,
       code: fileMeta.code,
       name: fileMeta.name,
-      size: fileMeta.size,
-      type: fileMeta.type,
-      folder_id: fileMeta.folderId || "all",
+      size: typeof fileMeta.size === "number" ? fileMeta.size : 0,
+      type: fileMeta.type || "application/octet-stream",
+      folder_id: targetFolderId,
       is_folder: !!fileMeta.isFolder,
       file_count: fileMeta.fileCount || 1,
       is_paused: !!fileMeta.isPaused,
       paused_remaining_ms: fileMeta.pausedRemainingMs || 0,
-      uploaded_at: uploadedAtIso,
-      expires_at: expiresAtIso,
       base64_data: base64Data || null,
     };
 
-    const { error } = await supabase
-      .from("workspace_files")
-      .upsert(filePayload);
-    if (error) {
-      console.warn(
-        "Could not upsert file into Supabase workspace_files:",
-        error.message,
-      );
+    // Candidate timestamp combinations (covering mixed schemas, pure timestamptz, or pure bigint)
+    const timestampVariants = [
+      // 1. created_at as bigint ms, expires_at as timestamptz ISO string (User's database schema)
+      { created_at: uploadedAtMs, expires_at: expiresAtIso },
+      // 2. Both as timestamptz ISO strings
+      { created_at: uploadedAtIso, expires_at: expiresAtIso },
+      // 3. Both as bigint numeric ms
+      { created_at: uploadedAtMs, expires_at: expiresAtMs },
+      // 4. created_at as timestamptz ISO, expires_at as bigint numeric ms
+      { created_at: uploadedAtIso, expires_at: expiresAtMs },
+    ];
+
+    if (existingRows && existingRows.length > 0) {
+      // Row already exists - update it using the first matching timestamp variant
+      let lastErr: any = null;
+      for (const variant of timestampVariants) {
+        const updatePayload = { ...basePayload, ...variant };
+        let { error: updateErr } = await supabase
+          .from("workspace_files")
+          .update(updatePayload as any)
+          .eq("workspace_id", workspaceId)
+          .eq("code", fileMeta.code);
+
+        if (!updateErr) {
+          lastErr = null;
+          break;
+        }
+
+        // If foreign key constraint violation, re-ensure parent workspace and retry once
+        if (
+          updateErr.code === "23503" ||
+          updateErr.message?.includes("foreign key") ||
+          updateErr.message?.includes("workspace_id_fkey")
+        ) {
+          await ensureWorkspaceInSupabase(
+            workspaceId,
+            ownerEmail,
+            undefined,
+            true,
+          );
+          const { error: retryFkErr } = await supabase
+            .from("workspace_files")
+            .update(updatePayload as any)
+            .eq("workspace_id", workspaceId)
+            .eq("code", fileMeta.code);
+          if (!retryFkErr) {
+            lastErr = null;
+            break;
+          }
+          updateErr = retryFkErr;
+        }
+
+        lastErr = updateErr;
+        // If type/syntax/range mismatch, try next timestamp variant
+        if (
+          updateErr.code === "22008" ||
+          updateErr.code === "22P02" ||
+          updateErr.code === "PGRST204" ||
+          updateErr.message?.includes("range") ||
+          updateErr.message?.includes("date/time") ||
+          updateErr.message?.includes("bigint")
+        ) {
+          continue;
+        }
+        break;
+      }
+      if (lastErr) {
+        console.warn("Could not update workspace_file:", lastErr.message);
+      }
+    } else {
+      // Row does not exist - insert new record using the first matching variant
+      let lastErr: any = null;
+      for (const variant of timestampVariants) {
+        const insertPayload = { id: rowId, ...basePayload, ...variant };
+        let { error: insertErr } = await supabase
+          .from("workspace_files")
+          .insert(insertPayload as any);
+
+        if (!insertErr) {
+          lastErr = null;
+          break;
+        }
+
+        // If foreign key constraint violation, re-ensure parent workspace and retry once
+        if (
+          insertErr.code === "23503" ||
+          insertErr.message?.includes("foreign key") ||
+          insertErr.message?.includes("workspace_id_fkey")
+        ) {
+          await ensureWorkspaceInSupabase(
+            workspaceId,
+            ownerEmail,
+            undefined,
+            true,
+          );
+          const { error: retryFkErr } = await supabase
+            .from("workspace_files")
+            .insert(insertPayload as any);
+          if (!retryFkErr) {
+            lastErr = null;
+            break;
+          }
+          insertErr = retryFkErr;
+        }
+
+        // If 'id' column does not exist in the table (PGRST204), try insert without 'id'
+        if (
+          insertErr.code === "PGRST204" ||
+          insertErr.message?.includes("id")
+        ) {
+          const payloadNoId = { ...basePayload, ...variant };
+          let { error: retryErr } = await supabase
+            .from("workspace_files")
+            .insert(payloadNoId as any);
+
+          if (!retryErr) {
+            lastErr = null;
+            break;
+          }
+
+          if (
+            retryErr.code === "23503" ||
+            retryErr.message?.includes("foreign key") ||
+            retryErr.message?.includes("workspace_id_fkey")
+          ) {
+            await ensureWorkspaceInSupabase(
+              workspaceId,
+              ownerEmail,
+              undefined,
+              true,
+            );
+            const { error: retryNoIdFk } = await supabase
+              .from("workspace_files")
+              .insert(payloadNoId as any);
+            if (!retryNoIdFk) {
+              lastErr = null;
+              break;
+            }
+            retryErr = retryNoIdFk;
+          }
+
+          insertErr = retryErr;
+        }
+
+        lastErr = insertErr;
+        // If date/time syntax error or numeric type mismatch, try next timestamp variant
+        if (
+          insertErr.code === "22008" ||
+          insertErr.code === "22P02" ||
+          insertErr.code === "PGRST204" ||
+          insertErr.message?.includes("range") ||
+          insertErr.message?.includes("date/time") ||
+          insertErr.message?.includes("bigint")
+        ) {
+          continue;
+        }
+        break;
+      }
+      if (lastErr) {
+        console.warn("Could not insert workspace_file:", lastErr.message);
+      }
     }
   } catch (err) {
-    console.warn("Could not upsert file into Supabase workspace_files:", err);
+    console.warn("Could not save file into Supabase workspace_files:", err);
   }
 }
 
@@ -968,27 +1527,212 @@ export async function deleteWorkspaceFileFromSupabase(
 }
 
 /**
+ * Permanently delete an entire workspace and all associated files, folders, and accounts.
+ * Cleans up Supabase workspace_files, workspaces, workspace_members,
+ * and clears all local storage cache and session data.
+ */
+export async function deleteEntireWorkspace(
+  workspaceId: string,
+  ownerEmail?: string,
+): Promise<{ success: boolean; error?: string }> {
+  if (!workspaceId) return { success: false, error: "Invalid workspace ID" };
+
+  try {
+    // 1. Delete all workspace files in Supabase for this workspace
+    const { error: filesErr } = await supabase
+      .from("workspace_files")
+      .delete()
+      .eq("workspace_id", workspaceId);
+
+    if (filesErr) {
+      console.warn("Notice deleting workspace_files:", filesErr.message);
+    }
+
+    if (ownerEmail) {
+      await supabase
+        .from("workspace_files")
+        .delete()
+        .eq("owner_email", ownerEmail.toLowerCase());
+    }
+
+    // 2. Delete workspace entry from Supabase workspaces table
+    const { error: wsErr } = await supabase
+      .from("workspaces")
+      .delete()
+      .eq("id", workspaceId);
+
+    if (wsErr) {
+      await supabase
+        .from("workspaces")
+        .delete()
+        .eq("workspace_id", workspaceId);
+    }
+
+    // 3. Delete workspace member entry from workspace_members
+    if (ownerEmail) {
+      await supabase
+        .from("workspace_members")
+        .delete()
+        .eq("email", ownerEmail.toLowerCase());
+    }
+
+    await supabase
+      .from("workspace_members")
+      .delete()
+      .eq("workspace_id", workspaceId);
+
+    // 4. Clean local cache
+    try {
+      const allWorkspaces = getAllWorkspaces();
+      delete allWorkspaces[workspaceId];
+      saveAllWorkspaces(allWorkspaces);
+
+      const users = getRegisteredUsers();
+      const filteredUsers = users.filter(
+        (u) =>
+          u.workspaceId !== workspaceId &&
+          (!ownerEmail || u.email.toLowerCase() !== ownerEmail.toLowerCase()),
+      );
+      saveRegisteredUsers(filteredUsers);
+
+      clearSessionFromStorage();
+    } catch (cacheErr) {
+      console.warn("Notice clearing local cache:", cacheErr);
+    }
+
+    return { success: true };
+  } catch (err: any) {
+    console.error("Error deleting workspace:", err);
+    return {
+      success: false,
+      error: err?.message || "Failed to delete workspace",
+    };
+  }
+}
+
+/**
  * Update workspace name in Supabase and local cache
  */
 export async function updateWorkspaceNameInSupabase(
   workspaceId: string,
   newName: string,
 ): Promise<void> {
-  updateWorkspaceName(workspaceId, newName);
+  const trimmedName = newName.trim();
+  if (!trimmedName || !workspaceId) return;
+
+  // 1. Update local cache immediately
+  updateWorkspaceName(workspaceId, trimmedName);
+
+  // 2. Fetch current workspace data to preserve folders and owner
+  const ws = getWorkspaceData(workspaceId);
+  const session = loadSavedSession();
+  const ownerEmail = (ws?.ownerEmail || session?.email || "")
+    .trim()
+    .toLowerCase();
+  const nowEpoch = Date.now();
+
+  let anySuccess = false;
+  let lastError: any = null;
 
   try {
-    const nowIso = new Date().toISOString();
-    await supabase
-      .from("workspaces")
-      .update({ name: newName, updated_at: nowIso })
+    // --- Step A: Update workspace_members table ---
+    if (ownerEmail) {
+      const { error: memErr1 } = await supabase
+        .from("workspace_members")
+        .update({ workspace_name: trimmedName, updated_at: nowEpoch })
+        .eq("email", ownerEmail);
+
+      if (!memErr1) {
+        anySuccess = true;
+      } else {
+        // Fallback without updated_at if column type differed
+        const { error: memErr1b } = await supabase
+          .from("workspace_members")
+          .update({ workspace_name: trimmedName })
+          .eq("email", ownerEmail);
+        if (!memErr1b) anySuccess = true;
+      }
+    }
+
+    const { error: memErr2 } = await supabase
+      .from("workspace_members")
+      .update({ workspace_name: trimmedName, updated_at: nowEpoch })
       .eq("workspace_id", workspaceId);
 
+    if (!memErr2) {
+      anySuccess = true;
+    } else {
+      const { error: memErr2b } = await supabase
+        .from("workspace_members")
+        .update({ workspace_name: trimmedName })
+        .eq("workspace_id", workspaceId);
+      if (!memErr2b) anySuccess = true;
+    }
+
+    // --- Step B: Update workspaces table ---
+    // 1. Direct update on existing row
+    const { error: wsUpdateErr1 } = await supabase
+      .from("workspaces")
+      .update({ name: trimmedName, updated_at: nowEpoch })
+      .eq("id", workspaceId);
+
+    if (!wsUpdateErr1) {
+      anySuccess = true;
+    } else {
+      const { error: wsUpdateErr1b } = await supabase
+        .from("workspaces")
+        .update({ name: trimmedName })
+        .eq("id", workspaceId);
+      if (!wsUpdateErr1b) anySuccess = true;
+    }
+
+    // Also update by workspace_id column if present
     await supabase
-      .from("workspace_members")
-      .update({ workspace_name: newName, updated_at: Date.now() })
+      .from("workspaces")
+      .update({ name: trimmedName })
       .eq("workspace_id", workspaceId);
-  } catch (err) {
-    console.warn("Could not update workspace name in Supabase:", err);
+
+    if (ownerEmail) {
+      await supabase
+        .from("workspaces")
+        .update({ name: trimmedName })
+        .eq("owner_email", ownerEmail);
+    }
+
+    // 2. Upsert into workspaces table with id as primary key to guarantee persistent row
+    const wsRecord: any = {
+      id: workspaceId,
+      workspace_id: workspaceId,
+      name: trimmedName,
+      owner_email: ownerEmail || "member@workspace.local",
+      folders: ws?.folders || [],
+      storage_limit_bytes: ws?.storageLimitBytes || 10737418240,
+      created_at: nowEpoch,
+      updated_at: nowEpoch,
+    };
+
+    let { error: upsertErr } = await supabase
+      .from("workspaces")
+      .upsert(wsRecord, { onConflict: "id" });
+
+    if (!upsertErr) {
+      anySuccess = true;
+    } else {
+      delete wsRecord.created_at;
+      delete wsRecord.updated_at;
+      let { error: upsertErr2 } = await supabase
+        .from("workspaces")
+        .upsert(wsRecord, { onConflict: "id" });
+      if (!upsertErr2) anySuccess = true;
+      else lastError = upsertErr2;
+    }
+  } catch (err: any) {
+    console.error("Supabase workspace rename exception:", err);
+    lastError = err;
+  }
+
+  if (!anySuccess && lastError) {
+    throw new Error(lastError.message || "Failed to update database record");
   }
 }
 
@@ -999,23 +1743,99 @@ export async function addFolderToWorkspaceInSupabase(
   workspaceId: string,
   folderName: string,
 ): Promise<WorkspaceFolder | null> {
-  const newFolder = addFolderToWorkspace(workspaceId, folderName);
-  if (!newFolder) return null;
+  let newFolder: WorkspaceFolder | null = null;
+  if (folderName && folderName.trim()) {
+    newFolder = addFolderToWorkspace(workspaceId, folderName);
+  }
 
   const ws = getWorkspaceData(workspaceId);
   if (ws && ws.folders) {
     try {
       const nowIso = new Date().toISOString();
-      await supabase
+      const nowEpoch = Date.now();
+
+      const wsPayload = {
+        id: workspaceId,
+        workspace_id: workspaceId,
+        name: ws.name || "Personal Workspace",
+        owner_email: ws.ownerEmail || "",
+        folders: ws.folders,
+        storage_limit_bytes: ws.storageLimitBytes || 10737418240,
+        updated_at: nowEpoch,
+      };
+
+      let { error: err1 } = await supabase
         .from("workspaces")
-        .update({ folders: ws.folders, updated_at: nowIso })
-        .eq("workspace_id", workspaceId);
+        .upsert(wsPayload, { onConflict: "id" });
+      if (err1) {
+        let { error: err2 } = await supabase
+          .from("workspaces")
+          .upsert(wsPayload, { onConflict: "workspace_id" });
+        if (err2) {
+          await supabase
+            .from("workspaces")
+            .update({ folders: ws.folders, updated_at: nowEpoch })
+            .eq("id", workspaceId);
+          await supabase
+            .from("workspaces")
+            .update({ folders: ws.folders, updated_at: nowEpoch })
+            .eq("workspace_id", workspaceId);
+          await supabase
+            .from("workspaces")
+            .update({ folders: ws.folders, updated_at: nowIso })
+            .eq("id", workspaceId);
+          await supabase
+            .from("workspaces")
+            .update({ folders: ws.folders, updated_at: nowIso })
+            .eq("workspace_id", workspaceId);
+        }
+      }
     } catch (err) {
       console.warn("Could not sync folders to Supabase:", err);
     }
   }
 
   return newFolder;
+}
+
+/**
+ * Move a workspace file to another folder in local storage and Supabase
+ */
+export function moveFileToFolder(
+  workspaceId: string,
+  code: string,
+  folderId: string,
+): void {
+  const allWorkspaces = getAllWorkspaces();
+  const ws = allWorkspaces[workspaceId];
+  if (!ws || !Array.isArray(ws.files)) return;
+  const file = ws.files.find((f) => f.code === code);
+  if (file) {
+    file.folderId = folderId || "all";
+    allWorkspaces[workspaceId] = ws;
+    saveAllWorkspaces(allWorkspaces);
+  }
+}
+
+/**
+ * Move a workspace file to another folder and sync with Supabase
+ */
+export async function moveFileToFolderInSupabase(
+  workspaceId: string,
+  code: string,
+  folderId: string,
+): Promise<void> {
+  moveFileToFolder(workspaceId, code, folderId);
+  try {
+    const targetFolderId = folderId || "all";
+    await supabase
+      .from("workspace_files")
+      .update({ folder_id: targetFolderId })
+      .eq("workspace_id", workspaceId)
+      .eq("code", code);
+  } catch (err) {
+    console.warn("Could not update file folder in Supabase:", err);
+  }
 }
 
 /**
@@ -1044,11 +1864,10 @@ export async function toggleFileExpiryPauseInSupabase(
       .eq("workspace_id", workspaceId)
       .eq("code", code);
 
+    // If schema uses bigint numeric for expires_at, fallback to numeric ms
     if (
       error &&
-      (error.code === "22P02" ||
-        error.message?.includes("bigint") ||
-        error.message?.includes("integer"))
+      (error.code === "22P02" || error.message?.includes("bigint"))
     ) {
       await supabase
         .from("workspace_files")
@@ -1089,11 +1908,10 @@ export async function toggleAllFilesExpiryPauseInSupabase(
         .eq("workspace_id", workspaceId)
         .eq("code", f.code);
 
+      // If schema uses bigint numeric for expires_at, fallback to numeric ms
       if (
         error &&
-        (error.code === "22P02" ||
-          error.message?.includes("bigint") ||
-          error.message?.includes("integer"))
+        (error.code === "22P02" || error.message?.includes("bigint"))
       ) {
         await supabase
           .from("workspace_files")
@@ -1124,13 +1942,32 @@ export function updateWorkspaceName(
   if (allWorkspaces[workspaceId]) {
     allWorkspaces[workspaceId].name = newName;
     saveAllWorkspaces(allWorkspaces);
+  }
 
-    // Update in session if matching
-    const session = loadSavedSession();
-    if (session && session.workspaceId === workspaceId) {
-      session.workspaceName = newName;
-      saveSessionToStorage(session);
+  // Update in session if matching
+  const session = loadSavedSession();
+  if (
+    session &&
+    (session.workspaceId === workspaceId || !session.workspaceId)
+  ) {
+    session.workspaceName = newName;
+    saveSessionToStorage(session);
+  }
+
+  // Update in registered users cache
+  const users = getRegisteredUsers();
+  let changed = false;
+  for (const u of users) {
+    if (
+      u.workspaceId === workspaceId ||
+      (session?.email && u.email.toLowerCase() === session.email.toLowerCase())
+    ) {
+      u.workspaceName = newName;
+      changed = true;
     }
+  }
+  if (changed) {
+    saveRegisteredUsers(users);
   }
 }
 
@@ -1152,7 +1989,9 @@ export function addFolderToWorkspace(
     createdAt: Date.now(),
   };
 
+  ws.folders = ws.folders || [];
   ws.folders.push(newFolder);
+  allWorkspaces[workspaceId] = ws;
   saveAllWorkspaces(allWorkspaces);
   return newFolder;
 }
@@ -1192,6 +2031,13 @@ export async function deleteFolderFromWorkspaceInSupabase(
   if (ws) {
     try {
       const nowIso = new Date().toISOString();
+      const nowEpoch = Date.now();
+
+      await supabase
+        .from("workspaces")
+        .update({ folders: ws.folders, updated_at: nowEpoch })
+        .eq("id", workspaceId);
+
       await supabase
         .from("workspaces")
         .update({ folders: ws.folders, updated_at: nowIso })

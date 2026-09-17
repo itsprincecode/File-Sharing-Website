@@ -1,5 +1,14 @@
 import React, { useState } from "react";
-import { User, Lock, Mail, ChevronRight, X, AlertCircle, HardDrive, Key } from "lucide-react";
+import {
+  User,
+  Lock,
+  Mail,
+  ChevronRight,
+  X,
+  AlertCircle,
+  HardDrive,
+  Key,
+} from "lucide-react";
 import { UserSession } from "../types";
 import { motion } from "motion/react";
 import { loginMember, registerMember } from "../utils/workspaceStorage";
@@ -47,7 +56,7 @@ export default function LoginView({
           cleanEmail,
           password,
           name || undefined,
-          workspaceName || undefined
+          workspaceName || undefined,
         );
         setLoading(false);
         onLoginSuccess(session);
@@ -69,7 +78,7 @@ export default function LoginView({
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
       {/* Dark Overlay backdrop */}
-      <div 
+      <div
         id="login-overlay"
         onClick={onClose}
         className="absolute inset-0 bg-black/80 backdrop-blur-sm cursor-pointer"
@@ -132,11 +141,13 @@ export default function LoginView({
         {/* Brand Banner */}
         <div className="text-center mb-5">
           <h3 className="text-xl font-extrabold text-white">
-            {isSignUp ? "Create Your Personal Workspace" : "Access Your Workspace"}
+            {isSignUp
+              ? "Create Your Personal Workspace"
+              : "Access Your Workspace"}
           </h3>
           <p className="text-xs text-gray-400 mt-1 max-w-xs mx-auto leading-relaxed">
-            {isSignUp 
-              ? "All workspace data is stored securely in the database. Enter your credentials to register." 
+            {isSignUp
+              ? "All workspace data is stored securely in the database. Enter your credentials to register."
               : "All workspace data is stored in the database. Enter your member email and password to view your private files."}
           </p>
         </div>
@@ -167,7 +178,11 @@ export default function LoginView({
           </div>
         )}
 
-        <form onSubmit={handleSubmit} className="space-y-3.5" autoComplete="off">
+        <form
+          onSubmit={handleSubmit}
+          className="space-y-3.5"
+          autoComplete="off"
+        >
           {isSignUp && (
             <>
               <div>
@@ -204,7 +219,7 @@ export default function LoginView({
                     autoComplete="off"
                     value={workspaceName}
                     onChange={(e) => setWorkspaceName(e.target.value)}
-                    placeholder="e.g. College Practicals"
+                    placeholder="e.g. Creative Cloud Vault"
                     className="w-full pl-10 pr-4 py-2.5 rounded-xl border text-sm font-medium focus:outline-none focus:ring-2 focus:ring-cyan-400/50 bg-gray-800/60 border-gray-700 text-white placeholder-gray-500"
                   />
                 </div>
@@ -248,7 +263,9 @@ export default function LoginView({
                 autoComplete="off"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                placeholder={isSignUp ? "Minimum 6 characters" : "Enter password"}
+                placeholder={
+                  isSignUp ? "Minimum 6 characters" : "Enter password"
+                }
                 className="w-full pl-10 pr-4 py-2.5 rounded-xl border text-sm font-medium focus:outline-none focus:ring-2 focus:ring-cyan-400/50 bg-gray-800/60 border-gray-700 text-white placeholder-gray-500"
               />
             </div>
@@ -263,11 +280,17 @@ export default function LoginView({
             {loading ? (
               <span className="flex items-center justify-center space-x-2">
                 <span className="h-4 w-4 rounded-full border-2 border-white/30 border-t-white animate-spin" />
-                <span>{isSignUp ? "Provisioning Workspace..." : "Verifying Credentials..."}</span>
+                <span>
+                  {isSignUp
+                    ? "Provisioning Workspace..."
+                    : "Verifying Credentials..."}
+                </span>
               </span>
             ) : (
               <>
-                <span>{isSignUp ? "Create Member Workspace" : "Access Workspace"}</span>
+                <span>
+                  {isSignUp ? "Create Member Workspace" : "Access Workspace"}
+                </span>
                 <ChevronRight className="h-4 w-4" />
               </>
             )}
@@ -277,7 +300,9 @@ export default function LoginView({
         {/* Toggle Mode */}
         <div className="mt-5 text-center">
           <p className="text-xs text-gray-400">
-            {isSignUp ? "Already have a member account?" : "Need a private cloud locker?"}{" "}
+            {isSignUp
+              ? "Already have a member account?"
+              : "Need a private cloud locker?"}{" "}
             <button
               id="login-signup-toggle"
               type="button"
@@ -287,7 +312,9 @@ export default function LoginView({
               }}
               className="font-bold text-cyan-400 hover:underline cursor-pointer ml-1"
             >
-              {isSignUp ? "Sign In Instead" : "Create Personal Workspace (Free 10GB)"}
+              {isSignUp
+                ? "Sign In Instead"
+                : "Create Personal Workspace (Free 100MB)"}
             </button>
           </p>
         </div>

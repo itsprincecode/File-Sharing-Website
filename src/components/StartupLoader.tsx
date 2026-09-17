@@ -16,7 +16,7 @@ export default function StartupLoader({ onComplete }: StartupLoaderProps) {
     const statusMilestones = [
       { at: 15, text: "Allocating Temporal Memory Space..." },
       { at: 35, text: "Connecting Supabase Cloud Database..." },
-      { at: 60, text: "Mounting Personal Workspace & 10GB Pro Engine..." },
+      { at: 60, text: "Mounting Personal Workspace & 100MB Pro Engine..." },
       { at: 82, text: "Activating High-Speed Folder ZIP Packaging..." },
       { at: 96, text: "Security Handshake Verified. Ready." },
     ];

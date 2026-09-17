@@ -215,7 +215,7 @@ export default function Navbar({
                     session?.email}
                 </span>
                 <span className="text-[10px] bg-cyan-500/20 text-cyan-400 px-2 py-0.5 rounded-full font-bold">
-                  {session?.tier} 10GB
+                  {session?.tier} 100MB
                 </span>
               </div>
               <button

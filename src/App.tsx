@@ -16,6 +16,9 @@ import {
   loadSavedSession,
   clearSessionFromStorage,
   syncCachedMembersToDatabase,
+  cleanupDuplicateWorkspaceFiles,
+  validateSessionAgainstSupabase,
+  factoryResetAllData,
 } from "./utils/workspaceStorage";
 import { listAllFiles } from "./utils/db";
 import { AnimatePresence, motion } from "motion/react";
@@ -33,6 +36,9 @@ import {
   Send,
   Mail,
   Phone,
+  Trash2,
+  AlertTriangle,
+  RefreshCw,
 } from "lucide-react";
 
 export default function App() {
@@ -51,11 +57,58 @@ export default function App() {
     return loadSavedSession() || DEFAULT_USER_SESSION;
   });
 
-  // Automatically synchronize any local workspace members, lockers, and files into Supabase on startup
+  const [deletionNotice, setDeletionNotice] = useState<string | null>(null);
+  const [showFactoryResetModal, setShowFactoryResetModal] =
+    useState<boolean>(false);
+  const [factoryResetConfirmText, setFactoryResetConfirmText] =
+    useState<string>("");
+  const [isFactoryResetting, setIsFactoryResetting] = useState<boolean>(false);
+
+  const handleFactoryResetConfirm = async () => {
+    if (factoryResetConfirmText.trim().toUpperCase() !== "RESET") return;
+    setIsFactoryResetting(true);
+    try {
+      const res = await factoryResetAllData();
+      if (res.success) {
+        setSession(DEFAULT_USER_SESSION);
+        setShowFactoryResetModal(false);
+        setFactoryResetConfirmText("");
+        setDeletionNotice(
+          "Factory Reset Complete: All workspaces, files, and member accounts have been cleared from both Supabase and your local browser.",
+        );
+        setActivePage("home");
+        setTimeout(() => {
+          try {
+            window.location.reload();
+          } catch {}
+        }, 800);
+      } else {
+        alert("Factory reset failed: " + (res.error || "Unknown error"));
+      }
+    } catch (err: any) {
+      console.error("Factory reset error:", err);
+    } finally {
+      setIsFactoryResetting(false);
+    }
+  };
+
+  // Automatically validate active session with Supabase and clean up duplicate files on startup
   useEffect(() => {
-    syncCachedMembersToDatabase().catch((err) => {
-      console.warn("Startup database synchronization notice:", err);
-    });
+    cleanupDuplicateWorkspaceFiles().catch(() => {});
+    validateSessionAgainstSupabase()
+      .then((validSession) => {
+        if (!validSession) {
+          setSession(DEFAULT_USER_SESSION);
+        } else {
+          setSession(validSession);
+          syncCachedMembersToDatabase().catch((err) => {
+            console.warn("Startup database synchronization notice:", err);
+          });
+        }
+      })
+      .catch(() => {
+        syncCachedMembersToDatabase().catch(() => {});
+      });
   }, []);
 
   // If user arrives via direct share link ?code=XXXXXX, route directly to transfer download
@@ -137,6 +190,35 @@ export default function App() {
         openLoginModal={openLoginModal}
       />
 
+      {/* Global Deletion Notification Banner */}
+      <AnimatePresence>
+        {deletionNotice && (
+          <motion.div
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+            className="fixed top-20 left-1/2 -translate-x-1/2 z-50 max-w-md w-full px-4"
+          >
+            <div className="flex items-center justify-between p-4 rounded-2xl bg-gray-900 border border-emerald-500/40 shadow-2xl text-white text-xs">
+              <div className="flex items-center space-x-2.5">
+                <div className="p-1.5 rounded-lg bg-emerald-500/20 text-emerald-400">
+                  <ShieldAlert className="h-4 w-4" />
+                </div>
+                <span className="font-semibold text-gray-200">
+                  {deletionNotice}
+                </span>
+              </div>
+              <button
+                onClick={() => setDeletionNotice(null)}
+                className="p-1 text-gray-400 hover:text-white rounded-lg transition ml-2 cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Main Pages section */}
       <main id="main-content-region" className="flex-grow z-10 relative">
         <AnimatePresence mode="wait">
@@ -183,6 +265,13 @@ export default function App() {
                 openLoginModal={(isSignUp) => openLoginModal(isSignUp ?? false)}
                 onOpenTransferTab={() => setActivePage("transfer")}
                 onNavigateToTransfer={() => setActivePage("transfer")}
+                onUpdateSession={setSession}
+                onWorkspaceDeleted={() => {
+                  setSession(DEFAULT_USER_SESSION);
+                  setActivePage("home");
+                  setDeletionNotice("Your workspace was permanently deleted.");
+                  setTimeout(() => setDeletionNotice(null), 6000);
+                }}
               />
             </motion.div>
           ) : activePage === "contact" ? (
@@ -214,7 +303,7 @@ export default function App() {
             </div>
             <p className="text-xs text-gray-400 leading-relaxed max-w-sm mb-5">
               An instant cloud sharing and personal workspace platform. Equipped
-              with folder archive ingestion, 6-digit retrieval codes, 10GB
+              with folder archive ingestion, 6-digit retrieval codes, 100MB
               personal cloud lockers, and peer-to-peer speeds.
             </p>
 
@@ -264,7 +353,7 @@ export default function App() {
                 >
                   <Linkedin className="h-4 w-4" />
                 </a>
-                {/* <a
+                <a
                   href="https://youtube.com"
                   target="_blank"
                   rel="noopener noreferrer"
@@ -273,7 +362,7 @@ export default function App() {
                   aria-label="YouTube"
                 >
                   <Youtube className="h-4 w-4" />
-                </a> */}
+                </a>
                 <a
                   href="https://github.com/itsprincecode"
                   target="_blank"
@@ -313,7 +402,7 @@ export default function App() {
                   <Mail className="h-4 w-4" />
                 </a>
                 <a
-                  href="tel:+919167853886"
+                  href="tel:+91 9167853886"
                   className="p-2.5 rounded-xl bg-gray-900 border border-gray-800 text-gray-400 hover:text-purple-400 hover:border-purple-400/40 hover:bg-purple-400/10 transition-all duration-200"
                   title="Telephone Support"
                   aria-label="Phone"
@@ -351,7 +440,7 @@ export default function App() {
             <ul className="space-y-2 text-xs text-gray-400">
               <li className="flex items-center space-x-1.5 text-cyan-400 font-semibold">
                 <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
-                <span>Private 10GB Cloud Lockers</span>
+                <span>Private 100MB Cloud Lockers</span>
               </li>
               <li className="flex items-center space-x-1.5">
                 <Lock className="h-3.5 w-3.5 shrink-0" />
@@ -363,18 +452,147 @@ export default function App() {
 
         <div className="max-w-7xl mx-auto border-t border-gray-800 mt-8 pt-6 flex flex-col sm:flex-row items-center justify-between gap-4">
           <p className="text-[10px] text-gray-400">
-            © 2026 Sendro & Workspace. All rights reserved. Developed by Prince Dev
+            © 2026 Sendro & Workspace. All rights reserved. Developed By Prince
+            Dev
           </p>
-          <div className="flex space-x-4 text-[10px] text-gray-400">
+          <div className="flex items-center space-x-4 text-[10px] text-gray-400">
             <span className="hover:text-cyan-400 cursor-pointer">
               Privacy Policy
             </span>
             <span className="hover:text-cyan-400 cursor-pointer">
               Storage Terms
             </span>
+            {/* <button
+              id="btn-footer-factory-reset"
+              onClick={() => {
+                setFactoryResetConfirmText("");
+                setShowFactoryResetModal(true);
+              }}
+              className="text-rose-400/80 hover:text-rose-400 font-medium transition cursor-pointer flex items-center space-x-1"
+            >
+              <Trash2 className="h-3 w-3" />
+              <span>Factory Reset (Clear All Data)</span>
+            </button> */}
           </div>
         </div>
       </footer>
+
+      {/* Factory Reset / Wipe All Data Modal */}
+      <AnimatePresence>
+        {showFactoryResetModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm"
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="w-full max-w-md bg-gray-900 border border-rose-500/30 rounded-2xl p-6 shadow-2xl relative overflow-hidden"
+            >
+              <div className="flex items-center space-x-3 text-rose-400 mb-3">
+                <div className="p-2.5 rounded-xl bg-rose-500/10 border border-rose-500/20">
+                  <AlertTriangle className="h-6 w-6 text-rose-400" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-lg text-white">
+                    Factory Reset All Data
+                  </h3>
+                  <p className="text-xs text-rose-400/80">
+                    Wipe all workspaces, members, and files
+                  </p>
+                </div>
+              </div>
+
+              <div className="my-4 p-3.5 bg-rose-950/30 border border-rose-500/20 rounded-xl text-xs text-gray-300 space-y-2">
+                <p className="font-medium text-rose-300">
+                  This action will completely wipe and reset the entire system:
+                </p>
+                <ul className="list-disc pl-4 space-y-1 text-gray-400 text-[11px]">
+                  <li>
+                    All files in{" "}
+                    <span className="font-mono text-gray-300">
+                      workspace_files
+                    </span>{" "}
+                    in Supabase
+                  </li>
+                  <li>
+                    All member accounts in{" "}
+                    <span className="font-mono text-gray-300">
+                      workspace_members
+                    </span>
+                  </li>
+                  <li>
+                    All workspaces in{" "}
+                    <span className="font-mono text-gray-300">workspaces</span>
+                  </li>
+                  <li>
+                    All local browser cache (
+                    <span className="font-mono text-gray-300">
+                      localStorage
+                    </span>
+                    ) and sessions
+                  </li>
+                </ul>
+              </div>
+
+              <div className="mb-5">
+                <label className="block text-xs font-semibold text-gray-300 mb-1.5">
+                  Type{" "}
+                  <span className="font-mono font-bold text-rose-400 bg-rose-500/10 px-1 py-0.5 rounded">
+                    RESET
+                  </span>{" "}
+                  to confirm:
+                </label>
+                <input
+                  type="text"
+                  value={factoryResetConfirmText}
+                  onChange={(e) => setFactoryResetConfirmText(e.target.value)}
+                  placeholder="RESET"
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-gray-800/80 border border-gray-700 text-white font-mono text-sm placeholder-gray-500 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500"
+                />
+              </div>
+
+              <div className="flex items-center justify-end space-x-3">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowFactoryResetModal(false);
+                    setFactoryResetConfirmText("");
+                  }}
+                  disabled={isFactoryResetting}
+                  className="px-4 py-2 rounded-xl text-xs font-semibold text-gray-400 hover:text-white hover:bg-gray-800 transition cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleFactoryResetConfirm}
+                  disabled={
+                    factoryResetConfirmText.trim().toUpperCase() !== "RESET" ||
+                    isFactoryResetting
+                  }
+                  className="flex items-center space-x-2 px-4 py-2 rounded-xl text-xs font-bold text-white bg-rose-600 hover:bg-rose-500 disabled:opacity-50 disabled:cursor-not-allowed transition cursor-pointer shadow-lg shadow-rose-600/20"
+                >
+                  {isFactoryResetting ? (
+                    <>
+                      <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                      <span>Resetting Everything...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Trash2 className="h-3.5 w-3.5" />
+                      <span>Wipe All Data & Fresh Start</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Login / Workspace setup modal */}
       <AnimatePresence>

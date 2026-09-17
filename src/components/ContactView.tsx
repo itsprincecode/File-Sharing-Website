@@ -90,37 +90,61 @@ export default function ContactView() {
       label: "Inquiries Desk",
       value: "+91 9167853886",
       desc: "Toll-free, Mon-Fri 9AM to 5PM PST",
-      href: "tel:+919167853886",
+      href: "tel:+18889029279",
     },
     {
       icon: <MapPin className="h-5 w-5 text-purple-400" />,
       label: "Office",
-      value: "Sendro Storage",
-      desc: "Mumbai, NSP (East)",
+      value: "Mumbai, NSP (E)",
+      desc: "India",
     },
   ];
 
   const socialChannels = [
     {
+      name: "Twitter / X",
+      handle: "@SendroTransfer",
+      href: "https://twitter.com",
+      icon: <Twitter className="h-5 w-5 text-sky-400" />,
+      badgeColor: "bg-sky-500/10 text-sky-400 border-sky-500/20",
+      btnHover: "hover:border-sky-500/50 hover:bg-sky-500/10",
+    },
+    {
+      name: "Facebook",
+      handle: "Sendro Official Community",
+      href: "https://facebook.com",
+      icon: <Facebook className="h-5 w-5 text-blue-500" />,
+      badgeColor: "bg-blue-500/10 text-blue-400 border-blue-500/20",
+      btnHover: "hover:border-blue-500/50 hover:bg-blue-500/10",
+    },
+    {
       name: "Instagram",
-      handle: "@itsprince.dev",
-      href: "https://instagram.com/itsprince.dev",
+      handle: "@Sendrotransfer",
+      href: "https://instagram.com",
       icon: <Instagram className="h-5 w-5 text-pink-500" />,
       badgeColor: "bg-pink-500/10 text-pink-400 border-pink-500/20",
       btnHover: "hover:border-pink-500/50 hover:bg-pink-500/10",
     },
     {
       name: "LinkedIn",
-      handle: "itsprincedev",
-      href: "https://linkedin.com/itsprincedev",
+      handle: "Sendro Technologies Ltd",
+      href: "https://linkedin.com",
       icon: <Linkedin className="h-5 w-5 text-blue-400" />,
       badgeColor: "bg-blue-500/10 text-blue-400 border-blue-500/20",
       btnHover: "hover:border-blue-500/50 hover:bg-blue-500/10",
     },
     {
+      name: "YouTube",
+      handle: "Sendro Guides",
+      href: "https://youtube.com",
+      icon: <Youtube className="h-5 w-5 text-red-500" />,
+      badgeColor: "bg-red-500/10 text-red-400 border-red-500/20",
+      btnHover: "hover:border-red-500/50 hover:bg-red-500/10",
+    },
+    {
       name: "GitHub",
       handle: "github.com/Sendro-transfer",
-      href: "https://github.com/itsprincecode",
+      href: "https://github.com",
       icon: <Github className="h-5 w-5 text-gray-200" />,
       badgeColor: "bg-gray-500/10 text-gray-300 border-gray-500/20",
       btnHover: "hover:border-gray-500/50 hover:bg-gray-700/20",
@@ -128,7 +152,7 @@ export default function ContactView() {
     {
       name: "Telegram",
       handle: "t.me/Sendrosupport",
-      href: "https://t.me/itsprincedev",
+      href: "https://t.me",
       icon: <Send className="h-5 w-5 text-cyan-400" />,
       badgeColor: "bg-cyan-500/10 text-cyan-400 border-cyan-500/20",
       btnHover: "hover:border-cyan-500/50 hover:bg-cyan-500/10",
@@ -136,7 +160,7 @@ export default function ContactView() {
     {
       name: "WhatsApp",
       handle: "Direct Support Chat",
-      href: "https://whatsapp.com/itsprincedev",
+      href: "https://whatsapp.com",
       icon: <MessageCircle className="h-5 w-5 text-emerald-400" />,
       badgeColor: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
       btnHover: "hover:border-emerald-500/50 hover:bg-emerald-500/10",
@@ -305,7 +329,7 @@ export default function ContactView() {
                         data-lpignore="true"
                         value={formData.email}
                         onChange={handleChange}
-                        placeholder="campusrise.community@gmail.com"
+                        placeholder="prince123@gmail.com"
                         className="w-full px-4 py-3 rounded-xl border text-sm font-medium focus:outline-none focus:ring-2 focus:ring-cyan-400/50 focus:border-cyan-400 bg-gray-800/50 border-gray-700 text-white"
                       />
                     </div>

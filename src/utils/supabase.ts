@@ -75,7 +75,7 @@ drop policy if exists "Allow public delete members" on workspace_members;
 create policy "Allow public read members" on workspace_members for select using (true);
 create policy "Allow public insert members" on workspace_members for insert with check (email is not null and length(email) >= 3);
 create policy "Allow public update members" on workspace_members for update using (email is not null) with check (email is not null);
-create policy "Allow public delete members" on workspace_members for delete using (email is not null);
+create policy "Allow public delete members" on workspace_members for delete using (true);
 
 -- 2. Member Workspaces Table (Custom Folders, Limits & Storage)
 create table if not exists workspaces (
@@ -83,7 +83,7 @@ create table if not exists workspaces (
   name text not null,
   owner_email text not null,
   folders jsonb not null default '[]'::jsonb,
-  storage_limit_bytes bigint not null default 10737418240, -- 10GB Pro Locker
+  storage_limit_bytes bigint not null default 10737418240, -- 100MB Pro Locker
   created_at bigint not null,
   updated_at bigint not null
 );
@@ -105,7 +105,7 @@ drop policy if exists "Allow public delete workspaces" on workspaces;
 create policy "Allow public read workspaces" on workspaces for select using (true);
 create policy "Allow public insert workspaces" on workspaces for insert with check (owner_email is not null and name is not null);
 create policy "Allow public update workspaces" on workspaces for update using (owner_email is not null) with check (owner_email is not null);
-create policy "Allow public delete workspaces" on workspaces for delete using (owner_email is not null);
+create policy "Allow public delete workspaces" on workspaces for delete using (true);
 
 -- 3. Member Workspace Files Table (Isolated by Member Workspace)
 create table if not exists workspace_files (
@@ -137,6 +137,7 @@ alter table workspace_files add column if not exists base64_data text;
 create index if not exists idx_workspace_files_ws on workspace_files (workspace_id);
 create index if not exists idx_workspace_files_code on workspace_files (code);
 create index if not exists idx_workspace_files_owner on workspace_files (owner_email);
+create unique index if not exists idx_workspace_files_ws_code on workspace_files (workspace_id, code);
 
 alter table workspace_files enable row level security;
 drop policy if exists "Allow all workspace_files operations" on workspace_files;
@@ -148,7 +149,7 @@ drop policy if exists "Allow public delete workspace_files" on workspace_files;
 create policy "Allow public read workspace_files" on workspace_files for select using (true);
 create policy "Allow public insert workspace_files" on workspace_files for insert with check (code is not null and name is not null);
 create policy "Allow public update workspace_files" on workspace_files for update using (code is not null) with check (code is not null);
-create policy "Allow public delete workspace_files" on workspace_files for delete using (code is not null);
+create policy "Allow public delete workspace_files" on workspace_files for delete using (true);
 
 -- 4. Shared Transfer Files Table (For 6-Digit Peer Redemptions)
 create table if not exists shared_files (

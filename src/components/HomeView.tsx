@@ -75,7 +75,7 @@ export default function HomeView({
           className="inline-flex items-center space-x-1.5 px-3.5 py-1 rounded-full border border-cyan-500/20 bg-cyan-500/10 text-cyan-700 dark:text-cyan-400 text-xs font-semibold mb-6 shadow-sm"
         >
           <Sparkles className="h-3.5 w-3.5 text-cyan-500 dark:text-cyan-400 animate-spin" />
-          <span>V2.5 Temporal Sharing & 10GB Personal Workspace</span>
+          <span>V2.5 Temporal Sharing & 100MB Personal Workspace</span>
         </motion.div>
 
         {/* Dynamic Display Heading */}
@@ -102,7 +102,7 @@ export default function HomeView({
         >
           Drop any files, multi-folder packages, or documents. Generate a secure
           6-digit retrieval code, or activate your dedicated personal workspace
-          locker with 10GB storage limit.
+          locker with 100MB storage limit.
         </motion.p>
 
         {/* Action Buttons: Quick Transfer & Personal Workspace */}
@@ -137,7 +137,7 @@ export default function HomeView({
               className="w-full sm:w-auto flex items-center justify-center space-x-2 px-7 py-3.5 bg-gray-500/10 hover:bg-cyan-500/15 border border-gray-500/20 hover:border-cyan-500/30 text-gray-700 hover:text-cyan-600 dark:text-gray-200 dark:hover:text-cyan-300 font-bold rounded-2xl transition-all duration-200 cursor-pointer text-sm sm:text-base"
             >
               <Plus className="h-4 w-4 text-cyan-600 dark:text-cyan-400" />
-              <span>Create Personal Workspace (10GB Pro)</span>
+              <span>Create Personal Workspace (100MB Pro)</span>
             </button>
           )}
         </motion.div>
@@ -160,8 +160,8 @@ export default function HomeView({
               </h3>
               <p className="text-xs sm:text-sm text-gray-600 dark:text-gray-400 mt-2 leading-relaxed">
                 Need to keep your files organized? Create your personal
-                workspace with up to 10GB capacity. Organize content into custom
-                folders, upload entire directories directly, track active
+                workspace with up to 100MB capacity. Organize content into
+                custom folders, upload entire directories directly, track active
                 6-digit download codes, and manage your locker from anywhere.
               </p>
               <div className="mt-4 flex flex-wrap items-center gap-3 text-xs">
@@ -175,7 +175,7 @@ export default function HomeView({
                 </span>
                 <span className="inline-flex items-center space-x-1 text-amber-700 dark:text-amber-400 font-semibold bg-amber-500/10 px-2.5 py-1 rounded-lg border border-amber-500/20">
                   <Sparkles className="h-3.5 w-3.5" />
-                  <span>10 GB Pro Storage</span>
+                  <span>100MB Storage</span>
                 </span>
               </div>
             </div>
